@@ -81,6 +81,10 @@ use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::{SIGRTMIN, register_signal_handler};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
+/// Nanoseconds per second; converts a wall-clock duration to counter ticks.
+#[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+pub const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::{
     COREDUMP_NAME_SIZE, CpuElf64Writable, CpuSegment, CpuState as DumpCpusState, DumpState,
@@ -159,6 +163,32 @@ pub enum Error {
     #[cfg(target_arch = "aarch64")]
     #[error("Error initialising GICR base address")]
     VcpuSetGicrBaseAddr(#[source] hypervisor::HypervisorCpuError),
+
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[error("Error reading vCPU virtual counter")]
+    VcpuGetCntvct(#[source] hypervisor::HypervisorCpuError),
+
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[error("Error writing vCPU virtual counter")]
+    VcpuSetCntvct(#[source] hypervisor::HypervisorCpuError),
+
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[error("Error reading counter frequency")]
+    VcpuGetCntfrq(#[source] hypervisor::HypervisorCpuError),
+
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[error("No vCPU available to access the guest counter")]
+    NoVcpu,
+
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[error("Host CLOCK_REALTIME is before the Unix epoch")]
+    HostRealtime(#[source] std::time::SystemTimeError),
+
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[error(
+        "Saved counter frequency ({saved} Hz) != host ({host} Hz); refusing to advance guest counter"
+    )]
+    CntfrqMismatch { saved: u64, host: u64 },
 
     #[error("Failed to join on vCPU threads: {0:?}")]
     ThreadCleanup(std::boxed::Box<dyn std::any::Any + std::marker::Send>),
@@ -671,6 +701,30 @@ impl Vcpu {
             .set_gic_redistributor_addr(gicr_base)
             .map_err(Error::VcpuSetGicrBaseAddr)?;
         Ok(())
+    }
+
+    ///
+    /// Reads the guest's virtual counter (`CNTVCT_EL0`).
+    ///
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    pub fn get_cntvct(&self) -> Result<u64> {
+        self.vcpu.get_cntvct().map_err(Error::VcpuGetCntvct)
+    }
+
+    ///
+    /// Writes the guest virtual counter (`CNTVCT_EL0`).
+    ///
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    pub fn set_cntvct(&self, val: u64) -> Result<()> {
+        self.vcpu.set_cntvct(val).map_err(Error::VcpuSetCntvct)
+    }
+
+    ///
+    /// Returns the architected counter frequency (`CNTFRQ_EL0`, Hz).
+    ///
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    pub fn cntfrq(&self) -> Result<u64> {
+        self.vcpu.cntfrq().map_err(Error::VcpuGetCntfrq)
     }
 }
 
@@ -1684,6 +1738,71 @@ impl CpuManager {
             .iter()
             .map(|cpu| cpu.lock().unwrap().get_mpidr())
             .collect()
+    }
+
+    /// Captures the guest-clock snapshot (boot vCPU counter + host wall clock,
+    /// sampled together) for a VM snapshot. Call only after the VM is paused: a
+    /// running vCPU can hold the vCPU lock while in KVM_RUN.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    pub fn get_timer_state(&self) -> Result<hypervisor::TimerState> {
+        let vcpu0 = self.vcpus.first().ok_or(Error::NoVcpu)?;
+        let vcpu0 = vcpu0.lock().unwrap();
+        let cntvct = vcpu0.get_cntvct()?;
+        let cntfrq = vcpu0.cntfrq()?;
+        // Fail the capture on a broken host clock rather than defaulting to 0:
+        // a 0 baseline would make resume's `now - host_realtime_ns` over-advance
+        // by ~55 years.
+        let host_realtime_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(Error::HostRealtime)?
+            .as_nanos() as u64;
+        Ok(hypervisor::TimerState {
+            cntvct,
+            host_realtime_ns,
+            cntfrq,
+        })
+    }
+
+    /// Advances the guest virtual counter so that after restore/migration receive
+    /// the guest clock reflects the wall time that elapsed while it was stopped.
+    /// Writes the ABSOLUTE target `saved.cntvct + elapsed_ticks` (restore pinned
+    /// the counter back to `saved.cntvct`); `saturating_sub` never steps back.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    pub fn advance_timer(&self, saved: &hypervisor::TimerState) -> Result<()> {
+        let vcpu0 = self.vcpus.first().ok_or(Error::NoVcpu)?;
+        let vcpu0 = vcpu0.lock().unwrap();
+
+        // A broken host clock can't yield the elapsed interval; surface it so
+        // resume() fails and keeps the saved timer for a retry.
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(Error::HostRealtime)?
+            .as_nanos() as u64;
+
+        // KVM doesn't rescale the counter frequency across hosts (unlike x86
+        // TSC), so a differing destination frequency would mis-scale the elapsed
+        // ticks; refuse rather than corrupt time.
+        // TODO: caught only here at resume, after the VM is already transferred,
+        // so an incompatible destination strands it. Rejecting earlier at
+        // migration-receive admission would be a user-visible change, so left as-is.
+        let host_cntfrq = vcpu0.cntfrq()?;
+        if host_cntfrq != saved.cntfrq {
+            return Err(Error::CntfrqMismatch {
+                saved: saved.cntfrq,
+                host: host_cntfrq,
+            });
+        }
+
+        let elapsed_ns = now_ns.saturating_sub(saved.host_realtime_ns);
+        let elapsed_ticks =
+            (elapsed_ns as u128 * saved.cntfrq as u128 / NANOS_PER_SECOND as u128) as u64;
+        let target = saved.cntvct.wrapping_add(elapsed_ticks);
+        // Boot vCPU only: relies on the vtimer offset being shared VM-wide (true
+        // on current kernels) via the ONE_REG path, not the separate
+        // KVM_ARM_SET_COUNTER_OFFSET ioctl. On a strictly per-vCPU kernel only
+        // vCPU0 would advance.
+        // TODO: for robustness across kernels, loop set_cntvct() over all vCPUs.
+        vcpu0.set_cntvct(target)
     }
 
     #[cfg(target_arch = "aarch64")]

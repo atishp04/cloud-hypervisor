@@ -100,7 +100,7 @@ use crate::landlock::LandlockError;
 use crate::memory_manager::{
     Error as MemoryManagerError, MemoryManager, MemoryManagerSnapshotData,
 };
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "kvm")))]
 use crate::migration::get_vm_snapshot;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::migration::url_to_file;
@@ -535,6 +535,10 @@ pub struct Vm {
     vm: Arc<dyn hypervisor::Vm>,
     #[cfg(target_arch = "x86_64")]
     saved_clock: Option<hypervisor::ClockData>,
+    // ARM64 analog of `saved_clock`: the guest-counter snapshot restored from a
+    // VM snapshot and consumed once to advance the guest clock before vCPUs run.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    saved_timer: Option<hypervisor::TimerState>,
     #[cfg(not(target_arch = "riscv64"))]
     numa_nodes: NumaNodes,
     #[cfg_attr(any(not(feature = "kvm"), target_arch = "aarch64"), allow(dead_code))]
@@ -695,6 +699,16 @@ impl Vm {
             None
         };
 
+        // ARM64 analog: pull the saved guest-counter snapshot from the restored
+        // VM snapshot (None for older snapshots, which skip the advance).
+        #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+        let saved_timer = if let Some(snapshot) = snapshot.as_ref() {
+            let vm_snapshot = get_vm_snapshot(snapshot).map_err(Error::Restore)?;
+            vm_snapshot.timer
+        } else {
+            None
+        };
+
         let state = if snapshot.is_some() {
             VmState::Paused
         } else {
@@ -714,6 +728,8 @@ impl Vm {
             vm,
             #[cfg(target_arch = "x86_64")]
             saved_clock,
+            #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+            saved_timer,
             #[cfg(not(target_arch = "riscv64"))]
             numa_nodes,
             #[cfg(not(target_arch = "riscv64"))]
@@ -3289,6 +3305,26 @@ impl Pausable for Vm {
             }
         }
 
+        // ARM64 analog: before the vCPUs run, advance the restored counter by the
+        // elapsed wall time, then consume the saved timer so a later same-host
+        // resume doesn't reapply it.
+        #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+        {
+            // KVM-only (uses KVM_REG_ARM_TIMER_CNT); gate on the backend so an
+            // MSHV VM in a kvm+mshv build never reaches the KVM stubs.
+            let is_kvm = self.hypervisor.hypervisor_type() == hypervisor::HypervisorType::Kvm;
+            if is_kvm {
+                if let Some(timer) = self.saved_timer.take() {
+                    if let Err(e) = self.cpu_manager.lock().unwrap().advance_timer(&timer) {
+                        self.saved_timer = Some(timer);
+                        return Err(MigratableError::Resume(anyhow!(
+                            "Could not advance guest counter: {e}"
+                        )));
+                    }
+                }
+            }
+        }
+
         if current_state == VmState::Paused {
             self.vm
                 .resume()
@@ -3309,6 +3345,11 @@ impl Pausable for Vm {
 pub struct VmSnapshot {
     #[cfg(target_arch = "x86_64")]
     pub clock: Option<hypervisor::ClockData>,
+    // ARM64 analog of `clock`. `#[serde(default)]` so snapshots taken before
+    // this field existed deserialize to `None` and simply skip the advance.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[serde(default)]
+    pub timer: Option<hypervisor::TimerState>,
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
     pub common_cpuid: Vec<hypervisor::arch::x86::CpuIdEntry>,
 }
@@ -3336,6 +3377,33 @@ impl Snapshottable for Vm {
                 "Trying to snapshot while VM is running"
             )));
         }
+
+        // ARM64 analog: capture the guest counter + host wall clock so a restore
+        // can advance by the elapsed wall time. Requires paused vCPUs (the Paused
+        // check above guarantees it; a running vCPU can hold the lock in KVM_RUN).
+        #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+        let saved_timer = if let Some(pending) = self.saved_timer {
+            // Restored but not yet resumed: the counter is still pinned to the
+            // saved value (resume() advances it once). Carry that baseline forward
+            // so a re-snapshot here keeps the off-host interval; TimerState is
+            // Copy, so saved_timer survives for resume().
+            Some(pending)
+        } else if self.hypervisor.hypervisor_type() == hypervisor::HypervisorType::Kvm {
+            // KVM VM: capture the live counter (KVM-only accessors; non-KVM falls
+            // through to None below). Fail the snapshot on error rather than emit
+            // one that would restore with an uncorrected clock.
+            Some(
+                self.cpu_manager
+                    .lock()
+                    .unwrap()
+                    .get_timer_state()
+                    .map_err(|e| {
+                        MigratableError::Snapshot(anyhow!("Could not capture timer state: {e}"))
+                    })?,
+            )
+        } else {
+            None
+        };
 
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
         let common_cpuid = {
@@ -3371,6 +3439,8 @@ impl Snapshottable for Vm {
         let vm_snapshot_state = VmSnapshot {
             #[cfg(target_arch = "x86_64")]
             clock: self.saved_clock,
+            #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+            timer: saved_timer,
             #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
             common_cpuid,
         };
