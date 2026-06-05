@@ -7983,19 +7983,28 @@ mod ivshmem {
     #[test]
     #[cfg(not(feature = "mshv"))]
     fn test_snapshot_restore_hotplug_virtiomem() {
-        snapshot_restore_common::_test_snapshot_restore(true, false);
+        snapshot_restore_common::_test_snapshot_restore(true, false, false);
     }
 
     #[test]
     #[cfg(not(feature = "mshv"))] // See issue #7437
     fn test_snapshot_restore_basic() {
-        snapshot_restore_common::_test_snapshot_restore(false, false);
+        snapshot_restore_common::_test_snapshot_restore(false, false, false);
     }
 
     #[test]
     #[cfg(not(feature = "mshv"))]
     fn test_snapshot_restore_with_resume() {
-        snapshot_restore_common::_test_snapshot_restore(false, true);
+        snapshot_restore_common::_test_snapshot_restore(false, true, false);
+    }
+
+    // Snapshot, wait out an off-host interval, then restore+resume and assert the
+    // guest wall clock caught up. Exercises the kvmclock path on x86_64 and the
+    // CNTVCT advance on aarch64.
+    #[test]
+    #[cfg(not(feature = "mshv"))]
+    fn test_snapshot_restore_clock() {
+        snapshot_restore_common::_test_snapshot_restore(false, true, true);
     }
 
     #[test]
@@ -8029,6 +8038,12 @@ mod snapshot_restore_common {
     use std::process::Command;
 
     use crate::*;
+
+    // Off-host interval simulated between snapshot and restore, and the maximum
+    // guest-vs-host clock skew tolerated afterwards. The interval must exceed the
+    // tolerance so a guest that fails to advance on restore is caught.
+    const CLOCK_DOWNTIME_SECS: u64 = 30;
+    const CLOCK_SKEW_TOLERANCE_SECS: i64 = 15;
 
     pub(crate) fn snapshot_and_check_events(
         api_socket: &str,
@@ -8079,7 +8094,11 @@ mod snapshot_restore_common {
         ));
     }
 
-    pub(crate) fn _test_snapshot_restore(use_hotplug: bool, use_resume_option: bool) {
+    pub(crate) fn _test_snapshot_restore(
+        use_hotplug: bool,
+        use_resume_option: bool,
+        check_clock: bool,
+    ) {
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
         let kernel_path = direct_kernel_boot_path();
@@ -8229,6 +8248,12 @@ mod snapshot_restore_common {
             .output()
             .unwrap();
 
+        // Simulate an off-host interval between snapshot and restore so the guest
+        // clock must visibly catch up on restore (asserted after resume below).
+        if check_clock {
+            thread::sleep(Duration::from_secs(CLOCK_DOWNTIME_SECS));
+        }
+
         let api_socket_restored = format!("{}.2", temp_api_path(&guest.tmp_dir));
         let event_path_restored = format!("{}.2", temp_event_monitor_path(&guest.tmp_dir));
 
@@ -8363,6 +8388,31 @@ mod snapshot_restore_common {
             }
 
             guest.check_devices_common(Some(&socket), Some(&console_text), None);
+
+            if check_clock {
+                // Across the off-host interval the restored guest's wall clock
+                // must catch up to real time: x86_64 via kvmclock
+                // (KVM_CLOCK_REALTIME), aarch64 via the CNTVCT advance. The test
+                // network is isolated, so the guest cannot NTP-correct itself --
+                // any catch-up is the restore path's doing.
+                let host_secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64;
+                let guest_secs = guest
+                    .ssh_command("date -u +%s")
+                    .unwrap()
+                    .trim()
+                    .parse::<i64>()
+                    .unwrap();
+                let skew = (host_secs - guest_secs).abs();
+                assert!(
+                    skew <= CLOCK_SKEW_TOLERANCE_SECS,
+                    "guest clock is {skew}s from host after restore \
+                     (host={host_secs}, guest={guest_secs}); the \
+                     {CLOCK_DOWNTIME_SECS}s off-host interval was not applied"
+                );
+            }
         });
         // Shutdown the target VM and check console output
         kill_child(&mut child);
