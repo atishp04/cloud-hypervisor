@@ -210,6 +210,22 @@ impl ClockData {
     }
 }
 
+/// ARM64 analog of x86's `ClockData`: a guest-clock snapshot serialized with a
+/// VM snapshot. ARM64 has no `KVM_SET_CLOCK`/`KVM_CLOCK_REALTIME`, so the VMM
+/// records the guest counter and host wall clock and advances the counter by
+/// the elapsed wall time itself at restore/migration receive.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+pub struct TimerState {
+    /// Guest virtual counter (`CNTVCT_EL0`) sampled while the VM is paused.
+    pub cntvct: u64,
+    /// Host `CLOCK_REALTIME` (nanoseconds since the epoch) at the same instant.
+    pub host_realtime_ns: u64,
+    /// Architected counter frequency (`CNTFRQ_EL0`, Hz); converts elapsed wall
+    /// time to counter ticks.
+    pub cntfrq: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HypervisorVmConfig {
     #[cfg(feature = "tdx")]

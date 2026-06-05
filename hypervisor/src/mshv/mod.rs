@@ -1390,6 +1390,24 @@ impl cpu::Vcpu for MshvVcpu {
         Ok(res)
     }
 
+    // Counter advance is KVM/arm64-only; MSHV has no `KVM_REG_ARM_TIMER_CNT`
+    // equivalent. The VMM gates capture/advance on `hypervisor_type() == Kvm`,
+    // so these trait stubs are never reached.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    fn get_cntvct(&self) -> cpu::Result<u64> {
+        unimplemented!()
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    fn set_cntvct(&self, _val: u64) -> cpu::Result<()> {
+        unimplemented!()
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    fn cntfrq(&self) -> cpu::Result<u64> {
+        unimplemented!()
+    }
+
     #[cfg(target_arch = "aarch64")]
     fn get_reg_list(&self, _reg_list: &mut crate::RegList) -> cpu::Result<()> {
         unimplemented!()

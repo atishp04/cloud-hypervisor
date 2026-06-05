@@ -119,9 +119,11 @@ pub use kvm_bindings::{
 #[cfg(target_arch = "aarch64")]
 use kvm_bindings::{
     KVM_GUESTDBG_USE_HW, KVM_NR_SPSR, KVM_REG_ARM_COPROC_MASK, KVM_REG_ARM_CORE, KVM_REG_ARM64,
-    KVM_REG_ARM64_SYSREG, KVM_REG_ARM64_SYSREG_CRM_MASK, KVM_REG_ARM64_SYSREG_CRN_MASK,
-    KVM_REG_ARM64_SYSREG_OP0_MASK, KVM_REG_ARM64_SYSREG_OP1_MASK, KVM_REG_ARM64_SYSREG_OP2_MASK,
-    KVM_REG_SIZE_U32, KVM_REG_SIZE_U64, KVM_REG_SIZE_U128, kvm_regs, user_pt_regs,
+    KVM_REG_ARM64_SYSREG, KVM_REG_ARM64_SYSREG_CRM_MASK, KVM_REG_ARM64_SYSREG_CRM_SHIFT,
+    KVM_REG_ARM64_SYSREG_CRN_MASK, KVM_REG_ARM64_SYSREG_CRN_SHIFT, KVM_REG_ARM64_SYSREG_OP0_MASK,
+    KVM_REG_ARM64_SYSREG_OP0_SHIFT, KVM_REG_ARM64_SYSREG_OP1_MASK, KVM_REG_ARM64_SYSREG_OP1_SHIFT,
+    KVM_REG_ARM64_SYSREG_OP2_MASK, KVM_REG_SIZE_U32, KVM_REG_SIZE_U64, KVM_REG_SIZE_U128, kvm_regs,
+    user_pt_regs,
 };
 #[cfg(target_arch = "riscv64")]
 use kvm_bindings::{KVM_REG_RISCV_CORE, kvm_riscv_core};
@@ -144,6 +146,20 @@ use crate::RegList;
 use crate::arch::aarch64::regs;
 #[cfg(target_arch = "x86_64")]
 use crate::kvm::x86_64::XsaveStateError;
+
+// `KVM_REG_ARM_TIMER_CNT`, the timer-counter firmware register the kernel
+// defines as `ARM64_SYS_REG(3, 3, 14, 3, 2)`. kvm-bindings exposes no constant
+// for it, so build the id as the kernel's `ARM64_SYS_REG` macro would
+// (op0=3, op1=3, crn=14, crm=3, op2=2 packed into the SYSREG fields).
+#[cfg(target_arch = "aarch64")]
+const KVM_REG_ARM_TIMER_CNT: u64 = KVM_REG_ARM64
+    | KVM_REG_SIZE_U64
+    | KVM_REG_ARM64_SYSREG as u64
+    | ((3_u64 << KVM_REG_ARM64_SYSREG_OP0_SHIFT) & KVM_REG_ARM64_SYSREG_OP0_MASK as u64)
+    | ((3_u64 << KVM_REG_ARM64_SYSREG_OP1_SHIFT) & KVM_REG_ARM64_SYSREG_OP1_MASK as u64)
+    | ((14_u64 << KVM_REG_ARM64_SYSREG_CRN_SHIFT) & KVM_REG_ARM64_SYSREG_CRN_MASK as u64)
+    | ((3_u64 << KVM_REG_ARM64_SYSREG_CRM_SHIFT) & KVM_REG_ARM64_SYSREG_CRM_MASK as u64)
+    | (2_u64 & KVM_REG_ARM64_SYSREG_OP2_MASK as u64);
 
 #[cfg(target_arch = "x86_64")]
 ioctl_io_nr!(KVM_NMI, kvm_bindings::KVMIO, 0x9a);
@@ -2716,6 +2732,52 @@ impl cpu::Vcpu for KvmVcpu {
             .get_one_reg(id, &mut bytes)
             .map_err(|e| cpu::HypervisorCpuError::GetSysRegister(e.into()))?;
         Ok(u64::from_le_bytes(bytes))
+    }
+
+    ///
+    /// Gets the guest virtual counter via `KVM_REG_ARM_TIMER_CNT`.
+    ///
+    #[cfg(target_arch = "aarch64")]
+    fn get_cntvct(&self) -> cpu::Result<u64> {
+        let mut bytes = [0_u8; 8];
+        self.fd
+            .get_one_reg(KVM_REG_ARM_TIMER_CNT, &mut bytes)
+            .map_err(|e| cpu::HypervisorCpuError::GetSysRegister(e.into()))?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    ///
+    /// Sets the guest virtual counter via `KVM_REG_ARM_TIMER_CNT`: KVM programs
+    /// the vtimer offset to `phys_counter - val` so the guest reads `val`. The
+    /// offset is shared VM-wide on current kernels, so callers program only the
+    /// boot vCPU (see `CpuManager::advance_timer`).
+    ///
+    #[cfg(target_arch = "aarch64")]
+    fn set_cntvct(&self, val: u64) -> cpu::Result<()> {
+        self.fd
+            .set_one_reg(KVM_REG_ARM_TIMER_CNT, &val.to_le_bytes())
+            .map_err(|e| cpu::HypervisorCpuError::SetSysRegister(e.into()))?;
+        Ok(())
+    }
+
+    ///
+    /// Returns the architected counter frequency (`CNTFRQ_EL0`, Hz).
+    ///
+    #[cfg(target_arch = "aarch64")]
+    fn cntfrq(&self) -> cpu::Result<u64> {
+        // KVM exposes no ONE_REG for CNTFRQ_EL0, but it reads identically at EL0
+        // in the host and the guest counter runs at the host frequency, so read
+        // it directly here rather than via the vCPU.
+        let cntfrq: u64;
+        // SAFETY: CNTFRQ_EL0 is unconditionally readable at EL0 on aarch64.
+        unsafe {
+            std::arch::asm!(
+                "mrs {}, cntfrq_el0",
+                out(reg) cntfrq,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        Ok(cntfrq)
     }
 
     ///

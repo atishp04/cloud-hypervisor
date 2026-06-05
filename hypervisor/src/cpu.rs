@@ -511,6 +511,21 @@ pub trait Vcpu: Send + Sync {
     #[cfg(target_arch = "aarch64")]
     fn get_sys_reg(&self, sys_reg: u32) -> Result<u64>;
     ///
+    /// Gets the guest virtual counter (`CNTVCT_EL0`).
+    ///
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    fn get_cntvct(&self) -> Result<u64>;
+    ///
+    /// Sets the guest virtual counter (`CNTVCT_EL0`).
+    ///
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    fn set_cntvct(&self, val: u64) -> Result<()>;
+    ///
+    /// Returns the architected counter frequency (`CNTFRQ_EL0`, Hz).
+    ///
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    fn cntfrq(&self) -> Result<u64>;
+    ///
     /// Gets the value of a non-core register on RISC-V 64-bit
     ///
     #[cfg(target_arch = "riscv64")]
