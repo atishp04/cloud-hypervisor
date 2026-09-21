@@ -2266,8 +2266,13 @@ impl DeviceManager {
             },
         );
 
-        self.cmdline_additions
-            .push(format!("earlycon=pl011,mmio,0x{:08x}", addr.0));
+        // pKVM's guest MMIO guard is not enrolled early enough for an explicit
+        // MMIO early console. The regular PL011 console becomes usable once
+        // the guest has installed the guard during boot.
+        if !self.config.lock().unwrap().is_pkvm_enabled() {
+            self.cmdline_additions
+                .push(format!("earlycon=pl011,mmio,0x{:08x}", addr.0));
+        }
 
         // Fill the device tree with a new node. In case of restore, we
         // know there is nothing to do, so we can simply override the
