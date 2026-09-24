@@ -546,8 +546,8 @@ impl Vcpu {
     ) -> Result<()> {
         #[cfg(target_arch = "aarch64")]
         {
-            self.init(vm)?;
-            self.finalize_sve()?;
+            let features = self.init(vm)?;
+            self.finalize_sve(features)?;
             self.verify_mpidr();
             arch::configure_vcpu(self.vcpu.as_ref(), self.id, boot_setup)
                 .map_err(Error::VcpuConfiguration)?;
@@ -589,7 +589,7 @@ impl Vcpu {
 
     /// Initializes an aarch64 specific vcpu for booting Linux.
     #[cfg(target_arch = "aarch64")]
-    pub fn init(&self, vm: &dyn hypervisor::Vm) -> Result<()> {
+    pub fn init(&self, vm: &dyn hypervisor::Vm) -> Result<u32> {
         let mut kvi = self.vcpu.create_vcpu_init();
 
         vm.get_preferred_target(&mut kvi)
@@ -601,7 +601,7 @@ impl Vcpu {
 
         self.vcpu.vcpu_init(&kvi).map_err(Error::VcpuArmInit)?;
 
-        Ok(())
+        Ok(kvi.features())
     }
 
     /// Panics if the MPIDR derived from the vCPU id has drifted away from the
@@ -619,16 +619,12 @@ impl Vcpu {
         );
     }
 
-    /// Finalizes SVE on the vCPU if the host supports it.
+    /// Finalizes SVE on the vCPU if it was enabled during initialization.
     /// Must be called after init() and before any register access.
     #[cfg(target_arch = "aarch64")]
-    pub fn finalize_sve(&self) -> Result<()> {
-        use std::arch::is_aarch64_feature_detected;
-        #[allow(clippy::nonminimal_bool)]
-        let sve_supported =
-            is_aarch64_feature_detected!("sve") || is_aarch64_feature_detected!("sve2");
-        if sve_supported {
-            let finalized_features = self.vcpu.vcpu_get_finalized_features();
+    pub fn finalize_sve(&self, features: u32) -> Result<()> {
+        let finalized_features = self.vcpu.vcpu_get_finalized_features();
+        if features & (1 << finalized_features) != 0 {
             self.vcpu
                 .vcpu_finalize(finalized_features)
                 .map_err(Error::VcpuArmFinalize)?;
@@ -1008,14 +1004,14 @@ impl CpuManager {
 
             #[cfg(target_arch = "aarch64")]
             {
-                vcpu.init(self.vm.as_ref())?;
+                let features = vcpu.init(self.vm.as_ref())?;
                 let pre_finalize = state.pre_finalize_regs();
                 if !pre_finalize.is_empty() {
                     vcpu.vcpu
                         .set_pre_finalize_regs(pre_finalize)
                         .map_err(Error::VcpuSetPreFinalizeRegs)?;
                 }
-                vcpu.finalize_sve()?;
+                vcpu.finalize_sve(features)?;
                 vcpu.verify_mpidr();
             }
 
@@ -3668,8 +3664,8 @@ mod tests {
             assert_eq!(mpidr_from_vcpu_id(id as u64), expected, "vCPU {id}");
 
             // Must be what the hypervisor itself calculates.
-            vcpu.init(vm.as_ref()).unwrap();
-            vcpu.finalize_sve().unwrap();
+            let features = vcpu.init(vm.as_ref()).unwrap();
+            vcpu.finalize_sve(features).unwrap();
             vcpu.verify_mpidr();
         }
     }

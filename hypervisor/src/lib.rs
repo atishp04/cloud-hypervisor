@@ -289,6 +289,18 @@ pub enum VcpuInit {
     Mshv(mshv_bindings::MshvVcpuInit),
 }
 
+#[cfg(target_arch = "aarch64")]
+impl VcpuInit {
+    pub fn features(&self) -> u32 {
+        match self {
+            #[cfg(feature = "kvm")]
+            Self::Kvm(kvi) => kvi.features[0],
+            #[cfg(feature = "mshv")]
+            Self::Mshv(_) => 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RegList {
     #[cfg(all(feature = "kvm", any(target_arch = "aarch64", target_arch = "riscv64")))]
