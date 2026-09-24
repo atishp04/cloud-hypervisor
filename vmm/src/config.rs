@@ -898,6 +898,10 @@ impl PlatformConfig {
                 syntax.push_str(",sev_snp=on|off");
             }
 
+            if cfg!(target_arch = "aarch64") {
+                syntax.push_str(",pkvm=on|off");
+            }
+
             syntax.push('"');
 
             syntax
@@ -965,6 +969,8 @@ impl PlatformConfig {
         parser.add("tdx");
         #[cfg(feature = "sev_snp")]
         parser.add("sev_snp");
+        #[cfg(target_arch = "aarch64")]
+        parser.add("pkvm");
         parser.parse(platform).map_err(Error::ParsePlatform)?;
 
         let num_pci_segments: u16 = parser
@@ -1008,6 +1014,12 @@ impl PlatformConfig {
             .map_err(Error::ParsePlatform)?
             .unwrap_or(Toggle(false))
             .0;
+        #[cfg(target_arch = "aarch64")]
+        let pkvm = parser
+            .convert::<Toggle>("pkvm")
+            .map_err(Error::ParsePlatform)?
+            .unwrap_or(Toggle(false))
+            .0;
 
         let mut platform_config = PlatformConfig {
             num_pci_segments,
@@ -1028,6 +1040,8 @@ impl PlatformConfig {
             tdx,
             #[cfg(feature = "sev_snp")]
             sev_snp,
+            #[cfg(target_arch = "aarch64")]
+            pkvm,
             vfio_p2p_dma,
         };
 
@@ -4047,6 +4061,11 @@ impl VmConfig {
     pub fn is_sev_snp_enabled(&self) -> bool {
         self.platform.as_ref().is_some_and(|p| p.sev_snp)
     }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn is_pkvm_enabled(&self) -> bool {
+        self.platform.as_ref().is_some_and(|p| p.pkvm)
+    }
 }
 
 impl Clone for VmConfig {
@@ -5196,6 +5215,23 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
     }
 
     #[test]
+    fn test_platform_pkvm_parsing() -> Result<()> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert!(PlatformConfig::parse("pkvm=on")?.pkvm);
+            assert!(!PlatformConfig::parse("pkvm=off")?.pkvm);
+            assert!(!PlatformConfig::parse("")?.pkvm);
+            PlatformConfig::parse("pkvm=maybe").unwrap_err();
+        }
+
+        // The option only exists on aarch64.
+        #[cfg(not(target_arch = "aarch64"))]
+        PlatformConfig::parse("pkvm=on").unwrap_err();
+
+        Ok(())
+    }
+
+    #[test]
     fn test_vsock_parsing() -> Result<()> {
         // socket and cid is required
         VsockConfig::parse("").unwrap_err();
@@ -5879,6 +5915,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             tdx: false,
             #[cfg(feature = "sev_snp")]
             sev_snp: false,
+            #[cfg(target_arch = "aarch64")]
+            pkvm: false,
         }
     }
 

@@ -1017,6 +1017,9 @@ components:
         sev_snp:
           type: boolean
           default: false
+        pkvm:
+          type: boolean
+          default: false
         iommufd:
           type: boolean
           default: false

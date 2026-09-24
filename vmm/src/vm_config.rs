@@ -159,6 +159,9 @@ pub struct PlatformConfig {
     #[cfg(feature = "sev_snp")]
     #[serde(default)]
     pub sev_snp: bool,
+    #[cfg(target_arch = "aarch64")]
+    #[serde(default)]
+    pub pkvm: bool,
     #[serde(default)]
     pub iommufd: bool,
     // FDs are not serialized and any deserialized value is invalid; see NetConfig::fds.
