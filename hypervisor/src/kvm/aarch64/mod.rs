@@ -92,6 +92,8 @@ pub const KVM_ARM64_SVE_VLS_REGID: u64 =
     KVM_REG_ARM64 | KVM_REG_SIZE_U512 | KVM_REG_ARM64_SVE as u64 | 0xffff;
 
 pub fn check_required_kvm_extensions(kvm: &Kvm) -> KvmResult<()> {
+    // Keep these probes on the system KVM fd: MpState and ImmediateExit report
+    // false when queried through a protected VM fd.
     macro_rules! check_extension {
         ($cap:expr) => {
             if !kvm.check_extension($cap) {
