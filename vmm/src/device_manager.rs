@@ -5039,6 +5039,30 @@ impl DeviceManager {
         // Update the PCID bitmap
         self.pci_segments[pci_segment_id as usize].pci_devices_down |= 1 << pci_device_bdf.device();
 
+        // A guest booted without UEFI firmware is handed an FDT and nothing
+        // else: configure_system() ignores the RSDP address on this
+        // architecture, so the ACPI namespace never reaches the guest and the
+        // _EJ0 method whose B0EJ write drives eject_device() can never run.
+        // Eject here instead. Without this the device, its BARs and the image
+        // behind them stay live even though the API call reported success, and
+        // a guest-side PCI rescan brings the removed disk straight back.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let device_tree_only = self
+                .config
+                .lock()
+                .unwrap()
+                .payload
+                .as_ref()
+                .is_some_and(|payload| payload.firmware.is_none());
+            if device_tree_only {
+                // eject_device() takes the device tree lock held above.
+                drop(device_tree);
+                self.eject_device(pci_segment_id, pci_device_bdf.device())?;
+                self.cleanup_vfio_ops();
+            }
+        }
+
         Ok(())
     }
 

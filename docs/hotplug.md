@@ -159,7 +159,10 @@ The same API can also be used to reduce the desired RAM for a VM. It is importan
 
 Extra PCI devices can be added and removed from a running `cloud-hypervisor` instance. This is controlled by making a HTTP API request to the VMM to ask for the additional device to be added, or for the existing device to be removed.
 
-Note: On AArch64 platform, PCI device hotplug can only be achieved using ACPI. Please refer to the [documentation](uefi.md#building-uefi-firmware-for-aarch64) for more information.
+Note: On AArch64 platform, the guest is only notified of PCI device hotplug through ACPI, which it has only when booted with UEFI firmware. Please refer to the [documentation](uefi.md#building-uefi-firmware-for-aarch64) for more information. A guest booted directly from a kernel image is described by a device tree alone and receives no notification:
+
+- A hot-added device is discovered only once the guest rescans the PCI bus, e.g. with `echo 1 > /sys/bus/pci/rescan`.
+- A removed device is ejected while the removal request is handled, which makes it a surprise removal. Have the guest release the device first, e.g. with `echo 1 > /sys/bus/pci/devices/<BDF>/remove`: ejecting a device that the guest still has bound leaves every later access to it hanging, with no way for the guest to recover.
 
 To use PCI device hotplug start the VM with the HTTP server.
 
