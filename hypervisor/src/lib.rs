@@ -267,6 +267,8 @@ pub struct HypervisorVmConfig {
     pub mem_size: u64,
     #[cfg(feature = "sev_snp")]
     pub vmsa_features: u64,
+    #[cfg(target_arch = "aarch64")]
+    pub pkvm: bool,
     pub nested: bool,
     pub smt_enabled: bool,
 }
