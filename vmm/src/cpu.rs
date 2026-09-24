@@ -75,7 +75,11 @@ use vm_device::BusDevice;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use vm_memory::ByteValued;
 #[cfg(feature = "guest_debug")]
-use vm_memory::{Bytes, GuestAddressSpace};
+use vm_memory::Bytes;
+#[cfg(any(feature = "guest_debug", target_arch = "aarch64"))]
+use vm_memory::GuestAddressSpace;
+#[cfg(target_arch = "aarch64")]
+use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion};
 use vm_memory::{GuestAddress, GuestMemoryAtomic};
 use vm_migration::{
     Migratable, MigratableError, Pausable, Snapshot, SnapshotData, Snapshottable, Transportable,
@@ -163,6 +167,14 @@ pub enum Error {
     #[cfg(target_arch = "aarch64")]
     #[error("Error setting pre-finalize registers")]
     VcpuSetPreFinalizeRegs(#[source] hypervisor::HypervisorCpuError),
+
+    #[cfg(target_arch = "aarch64")]
+    #[error("Error finalizing protected VM vCPU")]
+    VcpuFinalizeProtectedVm(#[source] hypervisor::HypervisorCpuError),
+
+    #[cfg(target_arch = "aarch64")]
+    #[error("Error pre-faulting protected VM memory")]
+    VcpuPreFaultMemory(#[source] hypervisor::HypervisorCpuError),
 
     #[cfg(target_arch = "aarch64")]
     #[error("Error initialising GICR base address")]
@@ -482,6 +494,8 @@ pub struct Vcpu {
     // The hypervisor abstracted CPU.
     vcpu: Box<dyn hypervisor::Vcpu>,
     id: u32,
+    #[cfg(target_arch = "aarch64")]
+    init_features: Option<u32>,
     #[cfg(target_arch = "x86_64")]
     vendor: CpuVendor,
 }
@@ -522,6 +536,8 @@ impl Vcpu {
         Ok(Vcpu {
             vcpu,
             id,
+            #[cfg(target_arch = "aarch64")]
+            init_features: None,
             #[cfg(target_arch = "x86_64")]
             vendor: cpu_vendor,
         })
@@ -546,7 +562,10 @@ impl Vcpu {
     ) -> Result<()> {
         #[cfg(target_arch = "aarch64")]
         {
-            let features = self.init(vm)?;
+            let features = match self.init_features {
+                Some(features) => features,
+                None => self.init(vm)?,
+            };
             self.finalize_sve(features)?;
             self.verify_mpidr();
             arch::configure_vcpu(self.vcpu.as_ref(), self.id, boot_setup)
@@ -1586,6 +1605,57 @@ impl CpuManager {
     // Starts all the vCPUs that the VM is booting with. Blocks until all vCPUs are running.
     pub fn start_boot_vcpus(&mut self, paused: bool) -> Result<()> {
         self.activate_vcpus(self.boot_vcpus(), false, Some(paused))
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn init_boot_vcpus(&self) -> Result<()> {
+        for vcpu in &self.vcpus {
+            let mut vcpu = vcpu.lock().unwrap();
+            vcpu.init_features = Some(vcpu.init(self.vm.as_ref())?);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn finalize_protected_vcpus(&self) -> Result<()> {
+        for vcpu in &self.vcpus {
+            vcpu.lock()
+                .unwrap()
+                .vcpu
+                .finalize_protected_vm()
+                .map_err(Error::VcpuFinalizeProtectedVm)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn pre_fault_guest_memory(
+        &self,
+        guest_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
+    ) -> Result<()> {
+        let vcpu = self
+            .vcpus
+            .first()
+            .ok_or(Error::DesiredVCpuCountIsZero)?
+            .lock()
+            .unwrap();
+        let memory = guest_memory.memory();
+        let start = time::Instant::now();
+        let mut total = 0u64;
+
+        for region in memory.iter() {
+            let size = region.len();
+            vcpu.vcpu
+                .pre_fault_memory(region.start_addr().raw_value(), size)
+                .map_err(Error::VcpuPreFaultMemory)?;
+            total += size;
+        }
+
+        info!(
+            "Pre-faulted {total} bytes of protected VM memory in {:.3} seconds",
+            start.elapsed().as_secs_f64()
+        );
+        Ok(())
     }
 
     #[cfg(feature = "mshv")]

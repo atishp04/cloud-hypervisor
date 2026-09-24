@@ -983,6 +983,17 @@ impl Vm {
             .create_boot_vcpus(snapshot_from_id(snapshot, CPU_MANAGER_SNAPSHOT_ID))
             .map_err(Error::CpuManager)?;
 
+        // pKVM requires every KVM_ARM_VCPU_INIT before the vGIC is created,
+        // since the first KVM_RUN snapshots both into the EL2 VM.
+        #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+        if is_kvm && snapshot.is_none() && config.lock().unwrap().is_pkvm_enabled() {
+            cpu_manager
+                .lock()
+                .unwrap()
+                .init_boot_vcpus()
+                .map_err(Error::CpuManager)?;
+        }
+
         // KVM-specific initialization
         #[cfg(feature = "kvm")]
         if is_kvm {
@@ -2927,6 +2938,18 @@ impl Vm {
 
         #[cfg(target_arch = "riscv64")]
         self.configure_system().unwrap();
+
+        #[cfg(target_arch = "aarch64")]
+        if self.config.lock().unwrap().is_pkvm_enabled() {
+            let guest_memory = self.memory_manager.lock().unwrap().guest_memory();
+            let cpu_manager = self.cpu_manager.lock().unwrap();
+            cpu_manager
+                .finalize_protected_vcpus()
+                .map_err(Error::CpuManager)?;
+            cpu_manager
+                .pre_fault_guest_memory(&guest_memory)
+                .map_err(Error::CpuManager)?;
+        }
 
         #[cfg(feature = "tdx")]
         if let Some(hob_address) = hob_address {
