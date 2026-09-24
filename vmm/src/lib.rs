@@ -1269,6 +1269,18 @@ impl Vmm {
             .context("Error deserialising config")
             .map_err(MigratableError::MigrateReceive)?;
 
+        #[cfg(target_arch = "aarch64")]
+        if vm_migration_config
+            .vm_config
+            .lock()
+            .unwrap()
+            .is_pkvm_enabled()
+        {
+            return Err(MigratableError::MigrateReceive(anyhow!(
+                "Live migration is not supported with pKVM"
+            )));
+        }
+
         let mode = vm_migration_config.memory_mode();
 
         // Mirrors the vm_restore handling of RestoreConfig.vfio_fds. The
@@ -2585,6 +2597,12 @@ impl RequestHandler for Vmm {
                 let vm_config = Arc::new(Mutex::new(
                     recv_vm_config(source_url).map_err(VmError::Restore)?,
                 ));
+                #[cfg(target_arch = "aarch64")]
+                if vm_config.lock().unwrap().is_pkvm_enabled() {
+                    return Err(VmError::Restore(MigratableError::Restore(anyhow!(
+                        "Restore is not supported with pKVM"
+                    ))));
+                }
                 restore_cfg
                     .validate(&vm_config.lock().unwrap().clone())
                     .map_err(VmError::ConfigValidation)?;
@@ -3323,6 +3341,11 @@ impl RequestHandler for Vmm {
     ) -> result::Result<(), MigratableError> {
         match self.vm {
             VmOwnership::Owned(ref vm) => {
+                if vm.is_pkvm_enabled() {
+                    return Err(MigratableError::MigrateSend(anyhow!(
+                        "Live migration is not supported with pKVM"
+                    )));
+                }
                 if vm.restoring() {
                     return Err(MigratableError::Conflict(anyhow!(
                         "An on-demand memory restore is still in progress"
