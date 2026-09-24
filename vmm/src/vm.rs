@@ -510,6 +510,15 @@ pub struct Vm {
 impl Vm {
     pub const HANDLED_SIGNALS: [i32; 1] = [SIGWINCH];
 
+    pub(crate) fn is_pkvm_enabled(&self) -> bool {
+        #[cfg(target_arch = "aarch64")]
+        {
+            return self.config.lock().unwrap().is_pkvm_enabled();
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        false
+    }
+
     #[cfg(feature = "sev_snp")]
     pub fn get_default_sev_snp_guest_policy() -> SnpPolicy {
         SnpPolicy::new()
@@ -2883,6 +2892,11 @@ impl Vm {
 impl Pausable for Vm {
     fn pause(&mut self) -> result::Result<(), MigratableError> {
         event!("vm", "pausing");
+        if self.is_pkvm_enabled() {
+            return Err(MigratableError::Pause(anyhow!(
+                "Pause is not supported with pKVM"
+            )));
+        }
         let new_state = VmState::Paused;
         self.state
             .valid_transition(new_state)
@@ -2957,6 +2971,12 @@ impl Snapshottable for Vm {
 
     fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
         event!("vm", "snapshotting");
+
+        if self.is_pkvm_enabled() {
+            return Err(MigratableError::Snapshot(anyhow!(
+                "Snapshot is not supported with pKVM"
+            )));
+        }
 
         if self.get_state() != VmState::Paused {
             return Err(MigratableError::Snapshot(anyhow!(
