@@ -258,6 +258,8 @@ impl From<&VmConfig> for hypervisor::HypervisorVmConfig {
             mem_size: _value.memory.total_size(),
             #[cfg(feature = "sev_snp")]
             vmsa_features: 0,
+            #[cfg(target_arch = "aarch64")]
+            pkvm: _value.is_pkvm_enabled(),
             nested: _value.cpus.nested,
             smt_enabled: _value
                 .cpus

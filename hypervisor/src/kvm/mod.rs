@@ -175,6 +175,13 @@ const KVM_REG_ARM_TIMER_CNT: u64 = KVM_REG_ARM64
     | ((3_u64 << KVM_REG_ARM64_SYSREG_CRM_SHIFT) & KVM_REG_ARM64_SYSREG_CRM_MASK as u64)
     | (2_u64 & KVM_REG_ARM64_SYSREG_OP2_MASK as u64);
 
+// `KVM_VM_TYPE_ARM_PROTECTED`, the VM type flag that pKVM host kernels
+// define in include/uapi/linux/kvm.h to create a protected VM. kvm-bindings
+// does not define it yet. It sits above the IPA size field
+// (`KVM_VM_TYPE_ARM_IPA_SIZE_MASK`), so both can be set in one VM type.
+#[cfg(target_arch = "aarch64")]
+const KVM_VM_TYPE_ARM_PROTECTED: u64 = 1 << 31;
+
 #[cfg(target_arch = "aarch64")]
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
@@ -1713,6 +1720,11 @@ impl hypervisor::Hypervisor for KvmHypervisor {
         #[cfg(target_arch = "aarch64")]
         if self.kvm.check_extension(Cap::ArmVmIPASize) {
             vm_type = self.kvm.get_host_ipa_limit().try_into().unwrap();
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if _config.pkvm {
+            vm_type |= KVM_VM_TYPE_ARM_PROTECTED;
         }
 
         #[cfg(target_arch = "x86_64")]
