@@ -144,12 +144,16 @@ pub use kvm_ioctls::{self, Cap, Kvm, VcpuExit};
 use log::error;
 use thiserror::Error;
 use vfio_ioctls::VfioDeviceFd;
+#[cfg(target_arch = "aarch64")]
+use vmm_sys_util::ioctl::ioctl_with_mut_ref;
 #[cfg(target_arch = "x86_64")]
 use vmm_sys_util::ioctl::ioctl_with_ref;
+#[cfg(feature = "tdx")]
+use vmm_sys_util::ioctl::ioctl_with_val;
+#[cfg(any(feature = "tdx", target_arch = "aarch64"))]
+use vmm_sys_util::ioctl_iowr_nr;
 #[cfg(target_arch = "x86_64")]
 use vmm_sys_util::{fam::FamStruct, ioctl_io_nr, ioctl_iow_nr};
-#[cfg(feature = "tdx")]
-use vmm_sys_util::{ioctl::ioctl_with_val, ioctl_iowr_nr};
 
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use crate::RegList;
@@ -184,6 +188,11 @@ const KVM_VM_TYPE_ARM_PROTECTED: u64 = 1 << 31;
 
 #[cfg(target_arch = "aarch64")]
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
+// KVM_PRE_FAULT_MEMORY keeps mapping until its whole range is done, unless
+// interrupted, and holds the VM's SRCU read lock meanwhile, so each call is
+// bounded to this size rather than covering a whole RAM region.
+#[cfg(target_arch = "aarch64")]
+const KVM_PRE_FAULT_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
 
 #[cfg(target_arch = "x86_64")]
 ioctl_io_nr!(KVM_NMI, kvm_bindings::KVMIO, 0x9a);
@@ -194,6 +203,14 @@ ioctl_iow_nr!(
     kvm_bindings::KVMIO,
     0xe1,
     kvm_bindings::kvm_device_attr
+);
+#[cfg(target_arch = "aarch64")]
+// _IOWR(KVMIO, 0xd5, struct kvm_pre_fault_memory) = 0xc040aed5.
+ioctl_iowr_nr!(
+    KVM_PRE_FAULT_MEMORY,
+    kvm_bindings::KVMIO,
+    0xd5,
+    kvm_bindings::kvm_pre_fault_memory
 );
 #[cfg(target_arch = "x86_64")]
 ioctl_iow_nr!(
@@ -640,6 +657,8 @@ struct KvmMemorySlot {
 /// Wrapper over KVM VM ioctls.
 pub struct KvmVm {
     fd: Arc<VmFd>,
+    #[cfg(target_arch = "aarch64")]
+    pkvm: bool,
     #[cfg(target_arch = "x86_64")]
     msrs: Vec<MsrEntry>,
     #[cfg(feature = "sev_snp")]
@@ -958,6 +977,8 @@ impl vm::Vm for KvmVm {
             xsave_size,
             #[cfg(target_arch = "x86_64")]
             has_xcrs: self.check_extension(Cap::Xcrs),
+            #[cfg(target_arch = "aarch64")]
+            pkvm: self.pkvm,
             #[cfg(feature = "sev_snp")]
             vm_fd: self.fd.clone(),
             #[cfg(feature = "sev_snp")]
@@ -1821,6 +1842,8 @@ impl hypervisor::Hypervisor for KvmHypervisor {
         {
             Ok(Arc::new(KvmVm {
                 fd: Arc::new(fd),
+                #[cfg(target_arch = "aarch64")]
+                pkvm: _config.pkvm,
                 dirty_log_slots: RwLock::new(HashMap::new()),
                 memory_slots: None,
             }))
@@ -1941,6 +1964,8 @@ impl hypervisor::Hypervisor for KvmHypervisor {
 /// Vcpu struct for KVM
 pub struct KvmVcpu {
     fd: VcpuFd,
+    #[cfg(target_arch = "aarch64")]
+    pkvm: bool,
     #[cfg(target_arch = "x86_64")]
     msrs: Vec<MsrEntry>,
     #[cfg(target_arch = "x86_64")]
@@ -2818,6 +2843,70 @@ impl cpu::Vcpu for KvmVcpu {
                 ))),
             },
         }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn finalize_protected_vm(&mut self) -> cpu::Result<()> {
+        if !self.pkvm {
+            return Err(cpu::HypervisorCpuError::Unsupported);
+        }
+
+        // pKVM creates the VM at EL2 on the first KVM_RUN of any of its vCPUs,
+        // and each vCPU's EL2 counterpart on that vCPU's first KVM_RUN. With
+        // immediate_exit set, KVM_RUN still performs that first-run setup but
+        // then returns EINTR instead of entering the guest.
+        self.fd.set_kvm_immediate_exit(true.into());
+        let result = self.fd.run().map(|_| ());
+        self.fd.set_kvm_immediate_exit(false.into());
+
+        match result {
+            Err(e) if e.errno() == libc::EINTR => Ok(()),
+            Err(e) => Err(cpu::HypervisorCpuError::FinalizeProtectedVm(e.into())),
+            Ok(_) => Err(cpu::HypervisorCpuError::FinalizeProtectedVmRanGuest),
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn pre_fault_memory(&self, gpa: u64, size: u64) -> cpu::Result<()> {
+        if !self.pkvm {
+            return Err(cpu::HypervisorCpuError::Unsupported);
+        }
+
+        let mut chunk_gpa = gpa;
+        let mut remaining = size;
+
+        while remaining > 0 {
+            let chunk_size = remaining.min(KVM_PRE_FAULT_CHUNK_SIZE);
+            let mut range = kvm_bindings::kvm_pre_fault_memory {
+                gpa: chunk_gpa,
+                size: chunk_size,
+                ..Default::default()
+            };
+
+            while range.size > 0 {
+                let previous_size = range.size;
+
+                // SAFETY: The ioctl operates on a vCPU fd and only mutates
+                // the supplied kvm_pre_fault_memory structure.
+                let ret =
+                    unsafe { ioctl_with_mut_ref(&self.fd, KVM_PRE_FAULT_MEMORY(), &mut range) };
+                if ret != 0 {
+                    let error = errno::Error::last();
+                    if error.errno() == libc::EINTR {
+                        continue;
+                    }
+                    return Err(cpu::HypervisorCpuError::PreFaultMemory(error.into()));
+                }
+                if range.size >= previous_size {
+                    return Err(cpu::HypervisorCpuError::PreFaultMemoryNoProgress(range.gpa));
+                }
+            }
+
+            chunk_gpa += chunk_size;
+            remaining -= chunk_size;
+        }
+
+        Ok(())
     }
 
     #[cfg(target_arch = "x86_64")]
