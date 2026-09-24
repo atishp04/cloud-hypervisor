@@ -44,6 +44,11 @@ const CLOCK_PHANDLE: u32 = 3;
 const GPIO_PHANDLE: u32 = 4;
 // This is a value for virtio-iommu. Now only one virtio-iommu device is supported.
 const VIRTIO_IOMMU_PHANDLE: u32 = 5;
+// This is a value for the restricted DMA pool used by protected VMs. The vCPU and
+// cache phandles are allocated upwards from FIRST_VCPU_PHANDLE and grow with the
+// vCPU count, but with at most 255 vCPUs on aarch64 they stay below 800, far from
+// this value.
+const RESTRICTED_DMA_POOL_PHANDLE: u32 = 0x8000;
 // NOTE: Keep FIRST_VCPU_PHANDLE the last PHANDLE defined.
 // This is a value for uniquely identifying the FDT node containing the first vCPU.
 // The last number of vCPU phandle depends on the number of vCPUs.
@@ -104,6 +109,7 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: BuildHasher>(
     numa_nodes: &NumaNodes,
     virtio_iommu_bdf: Option<u32>,
     pmu_supported: bool,
+    swiotlb_size: Option<u64>,
 ) -> FdtWriterResult<Vec<u8>> {
     // Allocate stuff necessary for the holding the blob.
     let mut fdt = FdtWriter::new().unwrap();
@@ -124,6 +130,7 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: BuildHasher>(
     fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
     create_cpu_nodes(&mut fdt, vcpu_mpidr, vcpu_topology, numa_nodes)?;
     create_memory_node(&mut fdt, guest_mem, numa_nodes)?;
+    let restricted_dma_phandle = create_reserved_memory_node(&mut fdt, swiotlb_size)?;
     create_chosen_node(&mut fdt, cmdline, initrd)?;
     create_gic_node(&mut fdt, gic_device)?;
     create_timer_node(&mut fdt)?;
@@ -133,7 +140,12 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: BuildHasher>(
     create_clock_node(&mut fdt)?;
     create_psci_node(&mut fdt)?;
     create_devices_node(&mut fdt, device_info)?;
-    create_pci_nodes(&mut fdt, pci_space_info, virtio_iommu_bdf)?;
+    create_pci_nodes(
+        &mut fdt,
+        pci_space_info,
+        virtio_iommu_bdf,
+        restricted_dma_phandle,
+    )?;
     if numa_nodes.len() > 1 {
         create_distance_map_node(&mut fdt, numa_nodes)?;
     }
@@ -485,6 +497,30 @@ fn create_memory_node(
     Ok(())
 }
 
+fn create_reserved_memory_node(
+    fdt: &mut FdtWriter,
+    swiotlb_size: Option<u64>,
+) -> FdtWriterResult<Option<u32>> {
+    let Some(swiotlb_size) = swiotlb_size else {
+        return Ok(None);
+    };
+
+    let reserved_memory_node = fdt.begin_node("reserved-memory")?;
+    fdt.property_u32("#address-cells", ADDRESS_CELLS)?;
+    fdt.property_u32("#size-cells", SIZE_CELLS)?;
+    fdt.property_null("ranges")?;
+
+    let restricted_dma_node = fdt.begin_node("restricted_dma_reserved")?;
+    fdt.property_u64("size", swiotlb_size)?;
+    fdt.property_u32("phandle", RESTRICTED_DMA_POOL_PHANDLE)?;
+    fdt.property_string("compatible", "restricted-dma-pool")?;
+    fdt.property_u64("alignment", 0x1_0000)?;
+    fdt.end_node(restricted_dma_node)?;
+    fdt.end_node(reserved_memory_node)?;
+
+    Ok(Some(RESTRICTED_DMA_POOL_PHANDLE))
+}
+
 fn create_chosen_node(
     fdt: &mut FdtWriter,
     cmdline: &str,
@@ -779,6 +815,7 @@ fn create_pci_nodes(
     fdt: &mut FdtWriter,
     pci_device_info: &[PciSpaceInfo],
     virtio_iommu_bdf: Option<u32>,
+    restricted_dma_phandle: Option<u32>,
 ) -> FdtWriterResult<()> {
     // Add node for PCIe controller.
     // See Documentation/devicetree/bindings/pci/host-generic-pci.txt in the kernel
@@ -876,6 +913,9 @@ fn create_pci_nodes(
         fdt.property_null("dma-coherent")?;
         fdt.property_array_u32("msi-map", &msi_map)?;
         fdt.property_u32("msi-parent", MSI_PHANDLE)?;
+        if let Some(phandle) = restricted_dma_phandle {
+            fdt.property_u32("memory-region", phandle)?;
+        }
 
         if pci_device_info_elem.pci_segment_id == 0
             && let Some(virtio_iommu_bdf) = virtio_iommu_bdf
@@ -1171,5 +1211,96 @@ mod tests {
         let mut fdt = FdtWriter::new().unwrap();
         let result = create_distance_map_node(&mut fdt, &numa_nodes);
         assert!(result.is_ok(), "Should default to 20 for missing distances");
+    }
+
+    #[test]
+    fn test_restricted_dma_pool() {
+        const SWIOTLB_SIZE: u64 = 64 << 20;
+        const PCI_NODES: [&str; 2] = ["/pci@40000000", "/pci@40100000"];
+
+        let create_blob = |swiotlb_size| {
+            let mut writer = FdtWriter::new().unwrap();
+            let root_node = writer.begin_node("").unwrap();
+            writer
+                .property_u32("#address-cells", ADDRESS_CELLS)
+                .unwrap();
+            writer.property_u32("#size-cells", SIZE_CELLS).unwrap();
+            let phandle = create_reserved_memory_node(&mut writer, swiotlb_size).unwrap();
+            create_pci_nodes(
+                &mut writer,
+                &[
+                    PciSpaceInfo {
+                        pci_segment_id: 0,
+                        mmio_config_address: 0x4000_0000,
+                        pci_device_space_start: PCI_HIGH_BASE.raw_value(),
+                        pci_device_space_size: 0x1000_0000,
+                    },
+                    PciSpaceInfo {
+                        pci_segment_id: 1,
+                        mmio_config_address: 0x4010_0000,
+                        pci_device_space_start: PCI_HIGH_BASE.raw_value() + 0x1000_0000,
+                        pci_device_space_size: 0x1000_0000,
+                    },
+                ],
+                None,
+                phandle,
+            )
+            .unwrap();
+            writer.end_node(root_node).unwrap();
+            writer.finish().unwrap()
+        };
+
+        // Without a pool, neither the pool nor any reference to it is emitted.
+        let blob = create_blob(None);
+        let fdt = fdt_parser::Fdt::new(&blob).unwrap();
+        assert!(fdt.find_node("/reserved-memory").is_none());
+        for path in PCI_NODES {
+            let pci = fdt.find_node(path).unwrap();
+            assert!(pci.property("memory-region").is_none());
+        }
+
+        let blob = create_blob(Some(SWIOTLB_SIZE));
+        let fdt = fdt_parser::Fdt::new(&blob).unwrap();
+
+        let reserved = fdt.find_node("/reserved-memory").unwrap();
+        assert_eq!(
+            reserved.property("#address-cells").unwrap().as_usize(),
+            Some(2)
+        );
+        assert_eq!(
+            reserved.property("#size-cells").unwrap().as_usize(),
+            Some(2)
+        );
+        assert!(reserved.property("ranges").is_some());
+
+        let pool = fdt
+            .find_node("/reserved-memory/restricted_dma_reserved")
+            .unwrap();
+        assert_eq!(
+            pool.property("size").unwrap().as_usize(),
+            Some(SWIOTLB_SIZE as usize)
+        );
+        assert_eq!(
+            pool.property("phandle").unwrap().as_usize(),
+            Some(RESTRICTED_DMA_POOL_PHANDLE as usize)
+        );
+        assert_eq!(
+            pool.property("compatible").unwrap().as_str(),
+            Some("restricted-dma-pool")
+        );
+        assert_eq!(
+            pool.property("alignment").unwrap().as_usize(),
+            Some(0x1_0000)
+        );
+        assert!(pool.property("reg").is_none());
+        assert!(pool.property("no-map").is_none());
+
+        for path in PCI_NODES {
+            let pci = fdt.find_node(path).unwrap();
+            assert_eq!(
+                pci.property("memory-region").unwrap().as_usize(),
+                Some(RESTRICTED_DMA_POOL_PHANDLE as usize)
+            );
+        }
     }
 }

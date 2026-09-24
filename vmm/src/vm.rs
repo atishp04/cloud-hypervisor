@@ -1955,6 +1955,7 @@ impl Vm {
             &vgic,
             &self.numa_nodes,
             pmu_supported,
+            None,
         )
         .map_err(Error::ConfigureSystem)?;
 
@@ -4075,6 +4076,7 @@ mod tests {
             &BTreeMap::new(),
             None,
             true,
+            None,
         )
         .unwrap();
     }
