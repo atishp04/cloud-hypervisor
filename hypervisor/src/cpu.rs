@@ -327,6 +327,36 @@ pub enum HypervisorCpuError {
     Nmi(#[source] anyhow::Error),
     #[error("Failed to get nested guest state")]
     GetNestedState(#[source] anyhow::Error),
+    ///
+    /// Operation not supported for this vCPU
+    ///
+    #[cfg(target_arch = "aarch64")]
+    #[error("Operation is not supported")]
+    Unsupported,
+    ///
+    /// Protected VM finalization error
+    ///
+    #[cfg(target_arch = "aarch64")]
+    #[error("Failed to finalize protected VM vCPU")]
+    FinalizeProtectedVm(#[source] anyhow::Error),
+    ///
+    /// Protected VM finalization ran guest code
+    ///
+    #[cfg(target_arch = "aarch64")]
+    #[error("Protected VM vCPU ran guest code instead of exiting immediately")]
+    FinalizeProtectedVmRanGuest,
+    ///
+    /// Protected VM memory pre-fault error
+    ///
+    #[cfg(target_arch = "aarch64")]
+    #[error("Failed to pre-fault protected VM memory")]
+    PreFaultMemory(#[source] anyhow::Error),
+    ///
+    /// Protected VM memory pre-fault made no progress
+    ///
+    #[cfg(target_arch = "aarch64")]
+    #[error("Pre-faulting protected VM memory made no progress at {0:#x}")]
+    PreFaultMemoryNoProgress(u64),
 }
 
 #[derive(Debug)]
@@ -544,6 +574,20 @@ pub trait Vcpu: Send + Sync {
     /// Set the "immediate_exit" state
     ///
     fn set_immediate_exit(&mut self, _exit: bool) {}
+    #[cfg(target_arch = "aarch64")]
+    ///
+    /// Finalize a protected VM vCPU without running guest code
+    ///
+    fn finalize_protected_vm(&mut self) -> Result<()> {
+        Err(HypervisorCpuError::Unsupported)
+    }
+    #[cfg(target_arch = "aarch64")]
+    ///
+    /// Map a range of protected VM memory before the guest touches it
+    ///
+    fn pre_fault_memory(&self, _gpa: u64, _size: u64) -> Result<()> {
+        Err(HypervisorCpuError::Unsupported)
+    }
     #[cfg(target_arch = "x86_64")]
     ///
     /// Return the list of initial MSR entries for a VCPU
