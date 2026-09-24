@@ -121,6 +121,12 @@ use crate::{
     MEMORY_MANAGER_SNAPSHOT_ID, MemoryZoneUpdateError, PciDeviceInfo, acpi, cpu,
 };
 
+/// Size of the restricted DMA pool that a pKVM guest bounces device DMA
+/// through. 64 MiB is the default size of the Linux swiotlb bounce buffer
+/// (`IO_TLB_DEFAULT_SIZE`) and of crosvm's pool for protected VMs.
+#[cfg(target_arch = "aarch64")]
+const PKVM_RESTRICTED_DMA_POOL_SIZE: u64 = 64 << 20;
+
 /// Errors associated with VM management
 #[derive(Debug, Error)]
 pub enum Error {
@@ -752,6 +758,10 @@ impl Vm {
         }
         #[cfg(feature = "sev_snp")]
         if _config.lock().unwrap().is_sev_snp_enabled() {
+            return true;
+        }
+        #[cfg(target_arch = "aarch64")]
+        if _config.lock().unwrap().is_pkvm_enabled() {
             return true;
         }
         false
@@ -1917,6 +1927,13 @@ impl Vm {
             .as_ref()
             .map(|(v, _)| *v);
 
+        let swiotlb_size = self
+            .config
+            .lock()
+            .unwrap()
+            .is_pkvm_enabled()
+            .then_some(PKVM_RESTRICTED_DMA_POOL_SIZE);
+
         let vgic = self
             .device_manager
             .lock()
@@ -1955,7 +1972,7 @@ impl Vm {
             &vgic,
             &self.numa_nodes,
             pmu_supported,
-            None,
+            swiotlb_size,
         )
         .map_err(Error::ConfigureSystem)?;
 
