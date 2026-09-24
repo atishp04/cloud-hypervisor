@@ -2636,26 +2636,23 @@ impl cpu::Vcpu for KvmVcpu {
             is_aarch64_feature_detected!("sve") || is_aarch64_feature_detected!("sve2");
 
         let mut kvm_kvi: kvm_bindings::kvm_vcpu_init = (*kvi).into();
+        let kvm_vm = vm.as_any().downcast_ref::<KvmVm>().unwrap();
 
         // We already checked that the capability is supported.
         kvm_kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_PSCI_0_2;
-        if vm
-            .as_any()
-            .downcast_ref::<KvmVm>()
-            .unwrap()
-            .check_extension(Cap::ArmPmuV3)
-        {
+        if kvm_vm.check_extension(Cap::ArmPmuV3) {
             kvm_kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_PMU_V3;
         }
 
-        if sve_supported
-            && vm
-                .as_any()
-                .downcast_ref::<KvmVm>()
-                .unwrap()
-                .check_extension(Cap::ArmSve)
-        {
+        if sve_supported && kvm_vm.check_extension(Cap::ArmSve) {
             kvm_kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_SVE;
+        }
+
+        if kvm_vm.check_extension(Cap::ArmPtrAuthAddress)
+            && kvm_vm.check_extension(Cap::ArmPtrAuthGeneric)
+        {
+            kvm_kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_PTRAUTH_ADDRESS;
+            kvm_kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_PTRAUTH_GENERIC;
         }
 
         // Non-boot cpus are powered off initially.
