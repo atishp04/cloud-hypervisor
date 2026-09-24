@@ -1039,7 +1039,7 @@ impl PlatformConfig {
             }
 
             if cfg!(target_arch = "aarch64") {
-                syntax.push_str(",pkvm=on|off");
+                syntax.push_str(",pkvm=on|off,pkvm_prefault=on|off");
             }
 
             syntax.push('"');
@@ -1106,7 +1106,7 @@ impl PlatformConfig {
         #[cfg(feature = "sev_snp")]
         parser.add("sev_snp");
         #[cfg(target_arch = "aarch64")]
-        parser.add("pkvm");
+        parser.add("pkvm").add("pkvm_prefault");
         parser.parse(platform).map_err(Error::ParsePlatform)?;
 
         let num_pci_segments: u16 = parser
@@ -1150,6 +1150,12 @@ impl PlatformConfig {
             .map_err(Error::ParsePlatform)?
             .unwrap_or(Toggle(false))
             .0;
+        #[cfg(target_arch = "aarch64")]
+        let pkvm_prefault = parser
+            .convert::<Toggle>("pkvm_prefault")
+            .map_err(Error::ParsePlatform)?
+            .unwrap_or(Toggle(false))
+            .0;
 
         let mut platform_config = PlatformConfig {
             num_pci_segments,
@@ -1170,6 +1176,8 @@ impl PlatformConfig {
             sev_snp,
             #[cfg(target_arch = "aarch64")]
             pkvm,
+            #[cfg(target_arch = "aarch64")]
+            pkvm_prefault,
             vfio_p2p_dma,
         };
 
@@ -4288,6 +4296,13 @@ impl VmConfig {
     pub fn is_pkvm_enabled(&self) -> bool {
         self.platform.as_ref().is_some_and(|p| p.pkvm)
     }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn is_pkvm_prefault_enabled(&self) -> bool {
+        self.platform
+            .as_ref()
+            .is_some_and(|p| p.pkvm && p.pkvm_prefault)
+    }
 }
 
 impl Clone for VmConfig {
@@ -5624,13 +5639,36 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             assert!(!PlatformConfig::parse("pkvm=off")?.pkvm);
             assert!(!PlatformConfig::parse("")?.pkvm);
             PlatformConfig::parse("pkvm=maybe").unwrap_err();
+            assert!(!PlatformConfig::parse("pkvm=on")?.pkvm_prefault);
+            assert!(PlatformConfig::parse("pkvm=on,pkvm_prefault=on")?.pkvm_prefault);
+            assert!(!PlatformConfig::parse("pkvm=on,pkvm_prefault=off")?.pkvm_prefault);
+            PlatformConfig::parse("pkvm=on,pkvm_prefault=maybe").unwrap_err();
         }
 
         // The option only exists on aarch64.
         #[cfg(not(target_arch = "aarch64"))]
-        PlatformConfig::parse("pkvm=on").unwrap_err();
+        {
+            PlatformConfig::parse("pkvm=on").unwrap_err();
+            PlatformConfig::parse("pkvm_prefault=off").unwrap_err();
+        }
 
         Ok(())
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_platform_pkvm_prefault_json() {
+        let legacy: PlatformConfig = serde_json::from_str(r#"{"pkvm":true}"#).unwrap();
+        assert!(!legacy.pkvm_prefault);
+
+        for enabled in [false, true] {
+            let json = format!(r#"{{"pkvm":true,"pkvm_prefault":{enabled}}}"#);
+            let platform: PlatformConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(platform.pkvm_prefault, enabled);
+            let roundtrip: PlatformConfig =
+                serde_json::from_str(&serde_json::to_string(&platform).unwrap()).unwrap();
+            assert_eq!(roundtrip, platform);
+        }
     }
 
     #[test]
@@ -6347,6 +6385,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             sev_snp: false,
             #[cfg(target_arch = "aarch64")]
             pkvm: false,
+            #[cfg(target_arch = "aarch64")]
+            pkvm_prefault: false,
         }
     }
 

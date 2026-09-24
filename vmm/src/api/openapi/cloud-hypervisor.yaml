@@ -1086,6 +1086,10 @@ components:
         pkvm:
           type: boolean
           default: false
+        pkvm_prefault:
+          type: boolean
+          default: false
+          description: Pre-fault protected guest RAM before starting vCPUs (Arm pKVM only).
         iommufd:
           type: boolean
           default: false

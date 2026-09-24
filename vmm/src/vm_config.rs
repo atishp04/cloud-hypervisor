@@ -171,6 +171,9 @@ pub struct PlatformConfig {
     #[cfg(target_arch = "aarch64")]
     #[serde(default)]
     pub pkvm: bool,
+    #[cfg(target_arch = "aarch64")]
+    #[serde(default)]
+    pub pkvm_prefault: bool,
     #[serde(default)]
     pub iommufd: bool,
     // FDs are not serialized and any deserialized value is invalid; see NetConfig::fds.

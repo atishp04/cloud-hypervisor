@@ -2540,6 +2540,21 @@ impl Vm {
         #[cfg(target_arch = "riscv64")]
         self.configure_system().unwrap();
 
+        #[cfg(target_arch = "aarch64")]
+        if self.config.lock().unwrap().is_pkvm_enabled() {
+            let prefault = self.config.lock().unwrap().is_pkvm_prefault_enabled();
+            let guest_memory = self.memory_manager.lock().unwrap().guest_memory();
+            let cpu_manager = self.cpu_manager.lock().unwrap();
+            cpu_manager
+                .finalize_protected_vcpus()
+                .map_err(Error::CpuManager)?;
+            if prefault {
+                cpu_manager
+                    .pre_fault_guest_memory(&guest_memory)
+                    .map_err(Error::CpuManager)?;
+            }
+        }
+
         // Resume the vm for MSHV
         if current_state == VmState::Created {
             self.vm.resume().map_err(Error::ResumeVm)?;
