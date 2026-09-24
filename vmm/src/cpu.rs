@@ -487,6 +487,8 @@ pub struct Vcpu {
     // The hypervisor abstracted CPU.
     vcpu: Box<dyn hypervisor::Vcpu>,
     id: u32,
+    #[cfg(target_arch = "aarch64")]
+    init_features: u32,
     #[cfg(target_arch = "x86_64")]
     vendor: CpuVendor,
 }
@@ -527,6 +529,8 @@ impl Vcpu {
         Ok(Vcpu {
             vcpu,
             id,
+            #[cfg(target_arch = "aarch64")]
+            init_features: 0,
             #[cfg(target_arch = "x86_64")]
             vendor: cpu_vendor,
         })
@@ -587,7 +591,7 @@ impl Vcpu {
 
     /// Initializes an aarch64 specific vcpu for booting Linux.
     #[cfg(target_arch = "aarch64")]
-    pub fn init(&self, vm: &dyn hypervisor::Vm) -> Result<()> {
+    pub fn init(&mut self, vm: &dyn hypervisor::Vm) -> Result<()> {
         let mut kvi = self.vcpu.create_vcpu_init();
 
         vm.get_preferred_target(&mut kvi)
@@ -598,6 +602,8 @@ impl Vcpu {
             .map_err(Error::VcpuSetProcessorFeatures)?;
 
         self.vcpu.vcpu_init(&kvi).map_err(Error::VcpuArmInit)?;
+
+        self.init_features = kvi.features();
 
         Ok(())
     }
@@ -617,16 +623,12 @@ impl Vcpu {
         );
     }
 
-    /// Finalizes SVE on the vCPU if the host supports it.
+    /// Finalizes SVE on the vCPU if it was enabled during initialization.
     /// Must be called after init() and before any register access.
     #[cfg(target_arch = "aarch64")]
     pub fn finalize_sve(&self) -> Result<()> {
-        use std::arch::is_aarch64_feature_detected;
-        #[allow(clippy::nonminimal_bool)]
-        let sve_supported =
-            is_aarch64_feature_detected!("sve") || is_aarch64_feature_detected!("sve2");
-        if sve_supported {
-            let finalized_features = self.vcpu.vcpu_get_finalized_features();
+        let finalized_features = self.vcpu.vcpu_get_finalized_features();
+        if self.init_features & (1 << finalized_features) != 0 {
             self.vcpu
                 .vcpu_finalize(finalized_features)
                 .map_err(Error::VcpuArmFinalize)?;
@@ -1059,7 +1061,11 @@ impl CpuManager {
         )?;
 
         #[cfg(target_arch = "aarch64")]
-        vcpu.init(self.vm.as_ref())?;
+        let vcpu = {
+            let mut vcpu = vcpu;
+            vcpu.init(self.vm.as_ref())?;
+            vcpu
+        };
 
         let vcpu = Arc::new(Mutex::new(vcpu));
 
@@ -3723,7 +3729,7 @@ mod tests {
             (17, 0x8000_0101),
             (255, 0x8000_0f0f),
         ] {
-            let vcpu = Vcpu::new(id, id, vm.as_ref(), None).unwrap();
+            let mut vcpu = Vcpu::new(id, id, vm.as_ref(), None).unwrap();
             assert_eq!(mpidr_from_vcpu_id(id as u64), expected, "vCPU {id}");
 
             // Must be what the hypervisor itself calculates.
