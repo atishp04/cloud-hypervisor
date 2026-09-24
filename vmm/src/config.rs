@@ -384,6 +384,34 @@ pub enum ValidationError {
     #[cfg(feature = "sev_snp")]
     #[error("Virtual IOMMU is not supported with SEV-SNP")]
     SevSnpNoViommu,
+    /// pKVM requires a build with KVM support
+    #[cfg(all(target_arch = "aarch64", not(feature = "kvm")))]
+    #[error("Using pKVM requires a build with KVM support")]
+    PkvmRequiresKvm,
+    /// Memory hotplug is not supported with pKVM
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[error("Memory hotplug is not supported with pKVM")]
+    PkvmNoMemoryHotplug,
+    /// CPU hotplug is not supported with pKVM
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[error("CPU hotplug is not supported with pKVM")]
+    PkvmNoCpuHotplug,
+    /// Huge pages are not supported with pKVM
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[error("Huge pages are not supported with pKVM")]
+    PkvmNoHugePages,
+    /// Balloon devices are not supported with pKVM
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[error("Balloon devices are not supported with pKVM")]
+    PkvmNoBalloon,
+    /// Firmware boot is not yet validated with pKVM
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[error("Firmware boot is not yet validated with pKVM")]
+    PkvmNoFirmware,
+    /// Guest debugging is not supported with pKVM
+    #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
+    #[error("Guest debugging is not supported with pKVM")]
+    PkvmNoGdb,
     /// Restore expects all net ids that have fds
     #[error("Net id {0} is associated with FDs and is required")]
     RestoreMissingRequiredNetId(String),
@@ -3345,6 +3373,37 @@ impl VmConfig {
                 }
             }
         }
+
+        // Protected VMs are only implemented by the KVM backend.
+        #[cfg(all(target_arch = "aarch64", not(feature = "kvm")))]
+        if self.is_pkvm_enabled() {
+            return Err(ValidationError::PkvmRequiresKvm);
+        }
+
+        #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+        if self.is_pkvm_enabled() {
+            if self.memory.hotplug_size() > 0 || self.memory.hotplugged_size() > 0 {
+                return Err(ValidationError::PkvmNoMemoryHotplug);
+            }
+            if self.cpus.max_vcpus != self.cpus.boot_vcpus {
+                return Err(ValidationError::PkvmNoCpuHotplug);
+            }
+            if self.memory.hugepages_enabled() {
+                return Err(ValidationError::PkvmNoHugePages);
+            }
+            if self.balloon.is_some() {
+                return Err(ValidationError::PkvmNoBalloon);
+            }
+            // At this point we know payload isn't None.
+            if self.payload.as_ref().unwrap().firmware.is_some() {
+                return Err(ValidationError::PkvmNoFirmware);
+            }
+            #[cfg(feature = "guest_debug")]
+            if self.gdb {
+                return Err(ValidationError::PkvmNoGdb);
+            }
+        }
+
         // The 'conflict' check is introduced in commit 24438e0390d3
         // (vm-virtio: Enable the vmm support for virtio-console).
         //
@@ -7151,6 +7210,109 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 invalid_config.validate(),
                 Err(ValidationError::SevSnpNoViommu)
             );
+        }
+
+        #[cfg(all(target_arch = "aarch64", not(feature = "kvm")))]
+        {
+            let mut invalid_config = valid_config.clone();
+            invalid_config.platform = Some(PlatformConfig {
+                pkvm: true,
+                ..platform_fixture()
+            });
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::PkvmRequiresKvm)
+            );
+        }
+
+        #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+        {
+            let mut pkvm_config = valid_config.clone();
+            pkvm_config.platform = Some(PlatformConfig {
+                pkvm: true,
+                ..platform_fixture()
+            });
+            pkvm_config.validate().unwrap();
+
+            let mut invalid_config = pkvm_config.clone();
+            invalid_config.memory.hotplug_size = Some(1);
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::PkvmNoMemoryHotplug)
+            );
+
+            let mut invalid_config = pkvm_config.clone();
+            invalid_config.memory.hotplugged_size = Some(1);
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::PkvmNoMemoryHotplug)
+            );
+
+            let mut invalid_config = pkvm_config.clone();
+            invalid_config.memory.zones = Some(vec![MemoryZoneConfig {
+                id: "mem0".to_string(),
+                size: 1 << 30,
+                hotplug_size: Some(1 << 30),
+                ..Default::default()
+            }]);
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::PkvmNoMemoryHotplug)
+            );
+
+            let mut invalid_config = pkvm_config.clone();
+            invalid_config.cpus.max_vcpus = 2;
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::PkvmNoCpuHotplug)
+            );
+
+            let mut invalid_config = pkvm_config.clone();
+            invalid_config.memory.hugepages = true;
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::PkvmNoHugePages)
+            );
+
+            let mut invalid_config = pkvm_config.clone();
+            invalid_config.memory.zones = Some(vec![MemoryZoneConfig {
+                id: "mem0".to_string(),
+                size: 1 << 30,
+                hugepages: true,
+                ..Default::default()
+            }]);
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::PkvmNoHugePages)
+            );
+
+            let mut invalid_config = pkvm_config.clone();
+            invalid_config.balloon = Some(BalloonConfig {
+                pci_common: PciDeviceCommonConfig::default(),
+                size: 0,
+                deflate_on_oom: false,
+                free_page_reporting: false,
+            });
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::PkvmNoBalloon)
+            );
+
+            let mut invalid_config = pkvm_config.clone();
+            let payload = invalid_config.payload.as_mut().unwrap();
+            payload.kernel = None;
+            payload.firmware = Some(PathBuf::from("/path/to/firmware"));
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::PkvmNoFirmware)
+            );
+
+            #[cfg(feature = "guest_debug")]
+            {
+                let mut invalid_config = pkvm_config.clone();
+                invalid_config.gdb = true;
+                assert_eq!(invalid_config.validate(), Err(ValidationError::PkvmNoGdb));
+            }
         }
 
         // x_nv_gpudirect_clique with vfio_p2p_dma=off should fail
