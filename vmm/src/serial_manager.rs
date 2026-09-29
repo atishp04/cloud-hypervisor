@@ -89,6 +89,7 @@ pub(crate) enum EpollDispatch {
     File = 0,
     Kill = 1,
     Socket = 2,
+    SocketWritable = 3,
     Unknown,
 }
 const EPOLL_EVENTS_LEN: usize = 4;
@@ -100,6 +101,7 @@ impl From<u64> for EpollDispatch {
             0 => File,
             1 => Kill,
             2 => Socket,
+            3 => SocketWritable,
             _ => Unknown,
         }
     }
@@ -331,6 +333,19 @@ impl SerialManager {
                                         unreachable!();
                                     };
                                     if let Some(console) = socket_console.as_mut() {
+                                        if let Some(fd) = console.writable_fd() {
+                                            epoll::ctl(
+                                                epoll_fd.as_raw_fd(),
+                                                epoll::ControlOptions::EPOLL_CTL_DEL,
+                                                fd,
+                                                epoll::Event::new(
+                                                    epoll::Events::EPOLLOUT
+                                                        | epoll::Events::EPOLLET,
+                                                    EpollDispatch::SocketWritable as u64,
+                                                ),
+                                            )
+                                            .map_err(Error::Epoll)?;
+                                        }
                                         if let Some(fd) = console.client_fd() {
                                             epoll::ctl(
                                                 epoll_fd.as_raw_fd(),
@@ -361,7 +376,36 @@ impl SerialManager {
                                             )
                                             .map_err(Error::Epoll)?;
                                         }
+                                        // Edge-triggered: the socket is writable nearly all
+                                        // the time, so level-triggered EPOLLOUT would spin
+                                        // this loop. An edge arrives when the client's reads
+                                        // free space.
+                                        if let Some(fd) = console.writable_fd() {
+                                            epoll::ctl(
+                                                epoll_fd.as_raw_fd(),
+                                                epoll::ControlOptions::EPOLL_CTL_ADD,
+                                                fd,
+                                                epoll::Event::new(
+                                                    epoll::Events::EPOLLOUT
+                                                        | epoll::Events::EPOLLET,
+                                                    EpollDispatch::SocketWritable as u64,
+                                                ),
+                                            )
+                                            .map_err(Error::Epoll)?;
+                                        }
                                     }
+                                }
+                                EpollDispatch::SocketWritable => {
+                                    // Send output held back while the socket was full.
+                                    // Bytes are held only after a write hits EAGAIN, so
+                                    // freeing that space raises a new edge; the write
+                                    // holds this same lock, so the flush always sees
+                                    // the held bytes.
+                                    serial
+                                        .lock()
+                                        .unwrap()
+                                        .flush_output()
+                                        .map_err(Error::FlushOutput)?;
                                 }
                                 EpollDispatch::File => {
                                     if event.events & libc::EPOLLIN as u32 != 0 {

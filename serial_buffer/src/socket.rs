@@ -5,7 +5,7 @@
 
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::Shutdown;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,6 +29,7 @@ pub struct SocketConsole {
     buffer: Arc<Mutex<SerialBuffer>>,
     write_out: Arc<AtomicBool>,
     reader: Option<UnixStream>,
+    writable: Option<OwnedFd>,
 }
 
 impl Default for SocketConsole {
@@ -48,6 +49,7 @@ impl SocketConsole {
             buffer,
             write_out,
             reader: None,
+            writable: None,
         }
     }
 
@@ -60,8 +62,18 @@ impl SocketConsole {
         self.reader.as_ref().map(|stream| stream.as_raw_fd())
     }
 
+    /// Returns a duplicate of the client fd to poll for writability, or None
+    /// when no client is attached. Output the socket could not take stays
+    /// buffered until the next flush, so flush when this fd becomes writable.
+    /// Being a separate fd, it can carry its own epoll event mask alongside
+    /// client_fd().
+    pub fn writable_fd(&self) -> Option<RawFd> {
+        self.writable.as_ref().map(|fd| fd.as_raw_fd())
+    }
+
     pub fn shutdown(&mut self) -> io::Result<()> {
         if let Some(stream) = self.reader.take() {
+            self.writable = None;
             let res = stream.shutdown(Shutdown::Both);
             self.detach();
             res?;
@@ -73,8 +85,10 @@ impl SocketConsole {
         let (stream, _) = listener.accept()?;
         stream.set_nonblocking(true)?;
         let writer = stream.try_clone()?;
+        let writable = stream.as_fd().try_clone_to_owned()?;
         self.attach(Box::new(writer))?;
         self.reader = Some(stream);
+        self.writable = Some(writable);
         Ok(())
     }
 
@@ -102,6 +116,7 @@ impl Read for SocketConsole {
             ended => {
                 let _ = stream.shutdown(Shutdown::Both);
                 self.reader = None;
+                self.writable = None;
                 self.detach();
                 ended
             }
@@ -111,11 +126,12 @@ impl Read for SocketConsole {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
+    use std::io::{ErrorKind, Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::thread;
     use std::time::Duration;
 
+    use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
     use vmm_sys_util::tempdir::TempDir;
 
     use super::SocketConsole;
@@ -199,9 +215,89 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let mut console = SocketConsole::new();
         assert!(console.client_fd().is_none());
+        assert!(console.writable_fd().is_none());
 
-        let _client = UnixStream::connect(&path).unwrap();
+        let client = UnixStream::connect(&path).unwrap();
         console.accept(&listener).unwrap();
         assert!(console.client_fd().is_some());
+        assert!(console.writable_fd().is_some());
+
+        // Hanging up drops both fds, so the socket is released.
+        drop(client);
+        assert_eq!(console.read(&mut [0u8; 1]).unwrap(), 0);
+        assert!(console.client_fd().is_none());
+        assert!(console.writable_fd().is_none());
+    }
+
+    // Output the socket cannot take is held in the buffer. Each time the
+    // client frees space, the writable fd reports one edge, and a flush on it
+    // sends held bytes without the device writing again.
+    #[test]
+    fn flushes_held_output_when_socket_becomes_writable() {
+        const INPUT: u64 = 0;
+        const WRITABLE: u64 = 1;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.as_path().join("socket");
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut console = SocketConsole::new();
+
+        let client = UnixStream::connect(&path).unwrap();
+        client.set_nonblocking(true).unwrap();
+        console.accept(&listener).unwrap();
+
+        // Watch the client as the serial manager does: input level-triggered,
+        // writability edge-triggered on the duplicate fd.
+        let epoll = Epoll::new().unwrap();
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                console.client_fd().unwrap(),
+                EpollEvent::new(EventSet::IN, INPUT),
+            )
+            .unwrap();
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                console.writable_fd().unwrap(),
+                EpollEvent::new(EventSet::OUT | EventSet::EDGE_TRIGGERED, WRITABLE),
+            )
+            .unwrap();
+        let mut events = [EpollEvent::default(); 2];
+        let mut wait = |timeout| {
+            let n = epoll.wait(timeout, &mut events).unwrap();
+            events[..n].iter().map(EpollEvent::data).collect::<Vec<_>>()
+        };
+
+        // An idle socket is writable: one edge, and no repeat while it stays so.
+        assert_eq!(wait(0), [WRITABLE]);
+        assert!(wait(0).is_empty());
+
+        // Write until the socket is full and output is held back. The pattern
+        // period is prime to the chunk size, so reordered chunks cannot match.
+        let mut sink = console.out_sink();
+        let mut sent = Vec::new();
+        while console.buffer.lock().unwrap().buffer.is_empty() {
+            let chunk: Vec<u8> = (sent.len()..sent.len() + 64)
+                .map(|i| (i % 251) as u8)
+                .collect();
+            sink.write_all(&chunk).unwrap();
+            sent.extend(chunk);
+        }
+        assert!(wait(0).is_empty());
+
+        // From here the device writes nothing: held bytes reach the client
+        // only through flushes on the edges that its reads produce.
+        let mut received = Vec::new();
+        loop {
+            let err = (&client).read_to_end(&mut received).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::WouldBlock);
+            if received.len() == sent.len() {
+                break;
+            }
+            assert_eq!(wait(1000), [WRITABLE]);
+            sink.flush().unwrap();
+        }
+        assert_eq!(received, sent);
     }
 }
