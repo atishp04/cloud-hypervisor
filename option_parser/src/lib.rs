@@ -349,7 +349,8 @@ impl FromStr for ByteSized {
             let s = s.trim_end_matches(['K', 'M', 'G']);
             s.parse::<u64>()
                 .map_err(|_| ByteSizedParseError::InvalidValue(s.to_owned()))?
-                << shift
+                .checked_mul(1u64 << shift)
+                .ok_or_else(|| ByteSizedParseError::InvalidValue(s.to_owned()))?
         }))
     }
 }
@@ -791,6 +792,8 @@ mod tests {
             ("2M", 2 * 1024 * 1024),
             ("4G", 4 * 1024 * 1024 * 1024),
             ("0K", 0),
+            ("18446744073709551615", u64::MAX),
+            ("18014398509481983K", u64::MAX - 1023),
         ];
         for (input, expected) in cases {
             let mut parser = OptionParser::new();
@@ -805,6 +808,9 @@ mod tests {
     fn test_byte_sized_invalid() {
         assert!("xyzK".parse::<ByteSized>().is_err());
         assert!("".parse::<ByteSized>().is_err());
+        for input in ["18014398509481984K", "17592186044672M", "17179869184G"] {
+            assert!(input.parse::<ByteSized>().is_err(), "Accepted {input}");
+        }
     }
 
     #[test]
