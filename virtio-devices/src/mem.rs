@@ -38,8 +38,8 @@ use vmm_sys_util::eventfd::EventFd;
 
 use super::{
     ActivateError, ActivateResult, EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError,
-    EpollHelperHandler, Error as DeviceError, VIRTIO_F_VERSION_1, VirtioCommon, VirtioDevice,
-    VirtioDeviceType,
+    EpollHelperHandler, Error as DeviceError, VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_VERSION_1,
+    VirtioCommon, VirtioDevice, VirtioDeviceType,
 };
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
@@ -754,6 +754,7 @@ impl Mem {
         numa_node_id: Option<u16>,
         initial_size: u64,
         hugepages: bool,
+        access_platform: bool,
         exit_evt: EventFd,
         blocks_state: Arc<Mutex<BlocksState>>,
         state: Option<MemState>,
@@ -777,6 +778,9 @@ impl Mem {
             )
         } else {
             let mut avail_features = 1u64 << VIRTIO_F_VERSION_1;
+            if access_platform {
+                avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
+            }
 
             let mut config = VirtioMemConfig {
                 block_size: VIRTIO_MEM_DEFAULT_BLOCK_SIZE,
@@ -1029,3 +1033,35 @@ impl Snapshottable for Mem {
 }
 impl Transportable for Mem {}
 impl Migratable for Mem {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_access_platform_features() {
+        let region = Arc::new(
+            GuestRegionMmap::from_range(GuestAddress(0), VIRTIO_MEM_ALIGN_SIZE as usize, None)
+                .unwrap(),
+        );
+        for access_platform in [false, true] {
+            let device = Mem::new(
+                "mem0".to_owned(),
+                &region,
+                SeccompAction::Allow,
+                None,
+                0,
+                false,
+                access_platform,
+                EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+                Arc::new(Mutex::new(BlocksState::new(region.len()))),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                device.features() & (1 << VIRTIO_F_ACCESS_PLATFORM) != 0,
+                access_platform,
+            );
+        }
+    }
+}

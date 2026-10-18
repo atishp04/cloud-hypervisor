@@ -2556,7 +2556,8 @@ impl Vm {
         #[cfg(target_arch = "aarch64")]
         if self.config.lock().unwrap().is_pkvm_enabled() {
             let prefault = self.config.lock().unwrap().is_pkvm_prefault_enabled();
-            let guest_memory = self.memory_manager.lock().unwrap().guest_memory();
+            let guest_memory =
+                GuestMemoryAtomic::new(self.memory_manager.lock().unwrap().boot_guest_memory());
             let cpu_manager = self.cpu_manager.lock().unwrap();
             cpu_manager
                 .finalize_protected_vcpus()

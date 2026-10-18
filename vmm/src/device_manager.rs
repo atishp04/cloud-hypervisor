@@ -3721,6 +3721,7 @@ impl DeviceManager {
                         node_id,
                         virtio_mem_zone.hotplugged_size(),
                         virtio_mem_zone.hugepages(),
+                        self.force_access_platform,
                         self.exit_evt
                             .try_clone()
                             .map_err(DeviceManagerError::EventFd)?,

@@ -423,9 +423,9 @@ pub enum ValidationError {
     #[cfg(all(target_arch = "aarch64", not(feature = "kvm")))]
     #[error("Using pKVM requires a build with KVM support")]
     PkvmRequiresKvm,
-    /// Memory hotplug is not supported with pKVM
+    /// pKVM supports only virtio-mem hotplug
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
-    #[error("Memory hotplug is not supported with pKVM")]
+    #[error("Only virtio-mem memory hotplug is supported with pKVM")]
     PkvmNoMemoryHotplug,
     /// CPU hotplug is not supported with pKVM
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
@@ -3623,7 +3623,9 @@ impl VmConfig {
 
         #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
         if self.is_pkvm_enabled() {
-            if self.memory.hotplug_size() > 0 || self.memory.hotplugged_size() > 0 {
+            if (self.memory.hotplug_size() > 0 || self.memory.hotplugged_size() > 0)
+                && self.memory.hotplug_method != HotplugMethod::VirtioMem
+            {
                 return Err(ValidationError::PkvmNoMemoryHotplug);
             }
             if self.cpus.max_vcpus != self.cpus.boot_vcpus {
@@ -7857,6 +7859,13 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 invalid_config.validate(),
                 Err(ValidationError::PkvmNoMemoryHotplug)
             );
+
+            let mut hotplug_config = pkvm_config.clone();
+            hotplug_config.memory.hotplug_method = HotplugMethod::VirtioMem;
+            hotplug_config.memory.hotplug_size = Some(1 << 30);
+            hotplug_config.validate().unwrap();
+            hotplug_config.memory.hotplugged_size = Some(128 << 20);
+            hotplug_config.validate().unwrap();
 
             let mut invalid_config = pkvm_config.clone();
             invalid_config.cpus.max_vcpus = 2;
