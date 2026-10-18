@@ -435,10 +435,10 @@ pub enum ValidationError {
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
     #[error("Huge pages are not supported with pKVM")]
     PkvmNoHugePages,
-    /// Balloon devices are not supported with pKVM
+    /// Free page reporting is not supported with pKVM
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
-    #[error("Balloon devices are not supported with pKVM")]
-    PkvmNoBalloon,
+    #[error("Balloon free page reporting is not supported with pKVM")]
+    PkvmNoBalloonReporting,
     /// Firmware boot is not yet validated with pKVM
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
     #[error("Firmware boot is not yet validated with pKVM")]
@@ -3632,8 +3632,8 @@ impl VmConfig {
             if self.memory.hugepages_enabled() {
                 return Err(ValidationError::PkvmNoHugePages);
             }
-            if self.balloon.is_some() {
-                return Err(ValidationError::PkvmNoBalloon);
+            if self.balloon.as_ref().is_some_and(|b| b.free_page_reporting) {
+                return Err(ValidationError::PkvmNoBalloonReporting);
             }
             // At this point we know payload isn't None.
             if self.payload.as_ref().unwrap().firmware.is_some() {
@@ -7884,16 +7884,20 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 Err(ValidationError::PkvmNoHugePages)
             );
 
-            let mut invalid_config = pkvm_config.clone();
-            invalid_config.balloon = Some(BalloonConfig {
+            let mut balloon_config = pkvm_config.clone();
+            balloon_config.balloon = Some(BalloonConfig {
                 pci_common: PciDeviceCommonConfig::default(),
                 size: 0,
                 deflate_on_oom: false,
                 free_page_reporting: false,
             });
+            balloon_config.validate().unwrap();
+            balloon_config.balloon.as_mut().unwrap().deflate_on_oom = true;
+            balloon_config.validate().unwrap();
+            balloon_config.balloon.as_mut().unwrap().free_page_reporting = true;
             assert_eq!(
-                invalid_config.validate(),
-                Err(ValidationError::PkvmNoBalloon)
+                balloon_config.validate(),
+                Err(ValidationError::PkvmNoBalloonReporting)
             );
 
             let mut invalid_config = pkvm_config.clone();
