@@ -14,6 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
+use std::fs::read_to_string;
 use std::io::{self, Write};
 use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
@@ -262,6 +264,60 @@ impl PartiallyBalloonedPage {
     }
 }
 
+struct BalloonedBlock {
+    bits: Vec<u64>,
+    pages: u64,
+}
+
+struct HugePageDiscard {
+    size: u64,
+    blocks: BTreeMap<u64, BalloonedBlock>,
+}
+
+impl HugePageDiscard {
+    fn new(size: u64) -> Option<Self> {
+        (size.is_power_of_two() && size > get_page_size()).then(|| Self {
+            size,
+            blocks: BTreeMap::new(),
+        })
+    }
+
+    fn inflate(&mut self, pfn: u32) -> Option<GuestAddress> {
+        let nr_pages = self.size >> VIRTIO_BALLOON_PFN_SHIFT;
+        let base = u64::from(pfn) & !(nr_pages - 1);
+        let offset = u64::from(pfn) - base;
+        let block = self.blocks.entry(base).or_insert_with(|| BalloonedBlock {
+            bits: vec![0; nr_pages.div_ceil(64) as usize],
+            pages: 0,
+        });
+        let bit = 1 << (offset % 64);
+        let word = &mut block.bits[(offset / 64) as usize];
+        if *word & bit != 0 {
+            return None;
+        }
+        *word |= bit;
+        block.pages += 1;
+        (block.pages == nr_pages).then_some(GuestAddress(base << VIRTIO_BALLOON_PFN_SHIFT))
+    }
+
+    fn deflate(&mut self, pfn: u32) {
+        let nr_pages = self.size >> VIRTIO_BALLOON_PFN_SHIFT;
+        let base = u64::from(pfn) & !(nr_pages - 1);
+        if let Some(block) = self.blocks.get_mut(&base) {
+            let offset = u64::from(pfn) - base;
+            let bit = 1 << (offset % 64);
+            let word = &mut block.bits[(offset / 64) as usize];
+            if *word & bit != 0 {
+                *word &= !bit;
+                block.pages -= 1;
+            }
+            if block.pages == 0 {
+                self.blocks.remove(&base);
+            }
+        }
+    }
+}
+
 const CONFIG_ACTUAL_OFFSET: u64 = 4;
 const CONFIG_ACTUAL_SIZE: usize = 4;
 
@@ -295,6 +351,7 @@ struct BalloonEpollHandler {
     kill_evt: EventFd,
     pause_evt: EventFd,
     pbp: Option<PartiallyBalloonedPage>,
+    huge_page_discard: Option<HugePageDiscard>,
     access_platform: Option<Arc<dyn AccessPlatform>>,
 }
 
@@ -407,6 +464,29 @@ impl BalloonEpollHandler {
         Ok(())
     }
 
+    fn retry_huge_page_discard(
+        &mut self,
+        memory: &GuestMemoryMmap,
+        range_base: GuestAddress,
+        range_len: usize,
+    ) {
+        let Some(discard) = self.huge_page_discard.as_mut() else {
+            return;
+        };
+        if memory.get_slice(range_base, range_len).is_err() {
+            return;
+        }
+        for offset in (0..range_len).step_by(VIRTIO_BALLOON_PAGE_SIZE) {
+            let pfn = ((range_base.0 + offset as u64) >> VIRTIO_BALLOON_PFN_SHIFT) as u32;
+            if let Some(base) = discard.inflate(pfn)
+                && memory.get_slice(base, discard.size as usize).is_ok()
+                && let Err(e) = Self::release_memory_range(memory, base, discard.size as usize)
+            {
+                warn!("Failed to release ballooned huge page at {base:?}: {e}");
+            }
+        }
+    }
+
     fn process_inflate_addresses(
         &mut self,
         memory: &GuestMemoryMmap,
@@ -420,6 +500,8 @@ impl BalloonEpollHandler {
                     Self::release_memory_range_partial_page(&mut self.pbp, memory, address)
                 {
                     warn!("Failed to release memory at address {:#x}: {e}", address.0);
+                } else {
+                    self.retry_huge_page_discard(memory, address, VIRTIO_BALLOON_PAGE_SIZE);
                 }
             }
             return;
@@ -444,6 +526,8 @@ impl BalloonEpollHandler {
                 } else {
                     if let Err(e) = Self::release_memory_range(memory, range_base, range_len) {
                         warn!("Failed to release ballooned memory range: {e}");
+                    } else {
+                        self.retry_huge_page_discard(memory, range_base, range_len);
                     }
                     range_base = address;
                     range_len = VIRTIO_BALLOON_PAGE_SIZE;
@@ -453,6 +537,8 @@ impl BalloonEpollHandler {
 
             if let Err(e) = Self::release_memory_range(memory, range_base, range_len) {
                 warn!("Failed to release ballooned memory range: {e}");
+            } else {
+                self.retry_huge_page_discard(memory, range_base, range_len);
             }
         }
     }
@@ -513,7 +599,11 @@ impl BalloonEpollHandler {
                                 inflate_addresses.clear();
                             }
                         }
-                        DEFLATE_QUEUE => {} // Nothing to do on deflate
+                        DEFLATE_QUEUE => {
+                            if let Some(discard) = self.huge_page_discard.as_mut() {
+                                discard.deflate(pfn);
+                            }
+                        }
                         _ => return Err(Error::InvalidQueueIndex(queue_index)),
                     }
                 }
@@ -1072,6 +1162,10 @@ impl VirtioDevice for Balloon {
             kill_evt,
             pause_evt,
             pbp: None,
+            huge_page_discard: read_to_string("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size")
+                .ok()
+                .and_then(|size| size.trim().parse().ok())
+                .and_then(HugePageDiscard::new),
             access_platform: self.common.access_platform(),
         };
 
@@ -1185,6 +1279,7 @@ mod tests {
             kill_evt: EventFd::new(EFD_NONBLOCK).unwrap(),
             pause_evt: EventFd::new(EFD_NONBLOCK).unwrap(),
             pbp: None,
+            huge_page_discard: None,
             access_platform: None,
         }
     }
@@ -1336,6 +1431,64 @@ mod tests {
             assert!(data[..balloon_size].iter().all(|byte| *byte == 0));
             assert!(data[balloon_size..].iter().all(|byte| *byte == 0xa5));
         }
+    }
+
+    #[test]
+    fn coalesced_discard_preserves_deflated_pages_across_batches() {
+        if get_page_size() as usize != VIRTIO_BALLOON_PAGE_SIZE {
+            return;
+        }
+        let size = 2 << 20;
+        let memory = TestMemory::from_ranges(&[(GuestAddress(0), size)]).unwrap();
+        let mut handler = create_stats_handler(
+            &memory,
+            Queue::new(16).unwrap(),
+            BalloonStatsState::WaitingForInitialDescriptor,
+        );
+        handler.huge_page_discard = HugePageDiscard::new(size as u64);
+        let mut first: SmallVec<[GuestAddress; VIRTIO_BALLOON_PFNS_PER_BATCH]> = (0..256)
+            .map(|pfn| GuestAddress(pfn << VIRTIO_BALLOON_PFN_SHIFT))
+            .collect();
+        handler.process_inflate_addresses(&memory, &mut first);
+        handler.huge_page_discard.as_mut().unwrap().deflate(17);
+        memory
+            .write_slice(&vec![0x5a; size / 2], GuestAddress(0))
+            .unwrap();
+
+        let mut second: SmallVec<[GuestAddress; VIRTIO_BALLOON_PFNS_PER_BATCH]> = (256..512)
+            .map(|pfn| GuestAddress(pfn << VIRTIO_BALLOON_PFN_SHIFT))
+            .collect();
+        handler.process_inflate_addresses(&memory, &mut second);
+        let mut data = vec![0xff; size];
+        memory.read_slice(&mut data, GuestAddress(0)).unwrap();
+        assert!(data[..size / 2].iter().all(|byte| *byte == 0x5a));
+        assert!(data[size / 2..].iter().all(|byte| *byte == 0));
+
+        let mut returned = SmallVec::from_slice(&[GuestAddress(17 << VIRTIO_BALLOON_PFN_SHIFT)]);
+        handler.process_inflate_addresses(&memory, &mut returned);
+        memory.read_slice(&mut data, GuestAddress(0)).unwrap();
+        assert!(data.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn huge_page_discard_requires_every_distinct_page() {
+        let mut discard = HugePageDiscard::new(2 << 20).unwrap();
+        for pfn in 0..511 {
+            assert_eq!(discard.inflate(pfn), None);
+            assert_eq!(discard.inflate(pfn), None);
+            assert_eq!(discard.inflate(pfn + 512), None);
+        }
+        assert_eq!(discard.inflate(511), Some(GuestAddress(0)));
+        assert_eq!(discard.inflate(1023), Some(GuestAddress(2 << 20)));
+        assert_eq!(discard.inflate(511), None);
+        discard.deflate(17);
+        discard.deflate(17);
+        assert_eq!(discard.inflate(17), Some(GuestAddress(0)));
+        for pfn in 0..1024 {
+            discard.deflate(pfn);
+        }
+        assert!(discard.blocks.is_empty());
+        assert_eq!(discard.inflate(17), None);
     }
 
     #[test]
