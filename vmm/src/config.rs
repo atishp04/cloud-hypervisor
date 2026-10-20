@@ -435,10 +435,10 @@ pub enum ValidationError {
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
     #[error("Huge pages are not supported with pKVM")]
     PkvmNoHugePages,
-    /// Free page reporting is not supported with pKVM
+    /// Free page reporting through a vIOMMU is not supported with pKVM
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
-    #[error("Balloon free page reporting is not supported with pKVM")]
-    PkvmNoBalloonReporting,
+    #[error("Balloon free page reporting through a vIOMMU is not supported with pKVM")]
+    PkvmNoBalloonReportingWithIommu,
     /// Firmware boot is not yet validated with pKVM
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
     #[error("Firmware boot is not yet validated with pKVM")]
@@ -3634,8 +3634,12 @@ impl VmConfig {
             if self.memory.hugepages_enabled() {
                 return Err(ValidationError::PkvmNoHugePages);
             }
-            if self.balloon.as_ref().is_some_and(|b| b.free_page_reporting) {
-                return Err(ValidationError::PkvmNoBalloonReporting);
+            if self
+                .balloon
+                .as_ref()
+                .is_some_and(|b| b.free_page_reporting && b.pci_common.iommu != IommuType::Off)
+            {
+                return Err(ValidationError::PkvmNoBalloonReportingWithIommu);
             }
             // At this point we know payload isn't None.
             if self.payload.as_ref().unwrap().firmware.is_some() {
@@ -7904,9 +7908,14 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             balloon_config.balloon.as_mut().unwrap().deflate_on_oom = true;
             balloon_config.validate().unwrap();
             balloon_config.balloon.as_mut().unwrap().free_page_reporting = true;
+            balloon_config.validate().unwrap();
+            let mut untranslated_balloon_config = balloon_config.clone();
+            untranslated_balloon_config.rng.pci_common.iommu = IommuType::Virtio;
+            untranslated_balloon_config.validate().unwrap();
+            balloon_config.balloon.as_mut().unwrap().pci_common.iommu = IommuType::Virtio;
             assert_eq!(
                 balloon_config.validate(),
-                Err(ValidationError::PkvmNoBalloonReporting)
+                Err(ValidationError::PkvmNoBalloonReportingWithIommu)
             );
 
             let mut invalid_config = pkvm_config.clone();

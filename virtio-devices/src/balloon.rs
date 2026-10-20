@@ -1492,6 +1492,108 @@ mod tests {
     }
 
     #[test]
+    fn reporting_discards_without_reading_payload_or_retaining_balloon_state() {
+        let page_size = get_page_size() as usize;
+        let report_address = GuestAddress((2 * page_size) as u64);
+        let first_page = GuestAddress(page_size as u64);
+        let memory = TestMemory::from_ranges(&[(GuestAddress(0), 8 * page_size)]).unwrap();
+        let guest_queue = VirtQueue::new(GuestAddress((6 * page_size) as u64), &memory, 16);
+        let mut handler = create_stats_handler(
+            &memory,
+            guest_queue.create_queue(),
+            BalloonStatsState::WaitingForInitialDescriptor,
+        );
+        handler.stats_handler = None;
+        handler.huge_page_discard = HugePageDiscard::new(2 << 20);
+        memory
+            .write_slice(&vec![0xa5; page_size * 3], first_page)
+            .unwrap();
+        let address = memory.get_host_address(report_address).unwrap();
+        assert_eq!(
+            // SAFETY: This page is mmap-backed, aligned, and separate from the queue.
+            unsafe { libc::mprotect(address.cast(), page_size, libc::PROT_NONE) },
+            0
+        );
+        guest_queue.dtable[0].set(report_address.raw_value(), page_size as u32, 2, 0);
+        guest_queue.avail.ring[0].set(0);
+        guest_queue.avail.idx.set(1);
+        handler.process_reporting_queue(0).unwrap();
+        assert_eq!(
+            // SAFETY: Restore the same mapping before verifying its contents.
+            unsafe {
+                libc::mprotect(
+                    address.cast(),
+                    page_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            },
+            0
+        );
+        let mut data = vec![0; page_size * 3];
+        memory.read_slice(&mut data, first_page).unwrap();
+        assert!(data[..page_size].iter().all(|byte| *byte == 0xa5));
+        assert!(data[page_size..page_size * 2].iter().all(|byte| *byte == 0));
+        assert!(data[page_size * 2..].iter().all(|byte| *byte == 0xa5));
+        assert_eq!(guest_queue.used.idx.get(), 1);
+        assert!(
+            handler
+                .huge_page_discard
+                .as_ref()
+                .unwrap()
+                .blocks
+                .is_empty()
+        );
+
+        memory
+            .write_slice(&vec![0x5a; page_size], report_address)
+            .unwrap();
+        guest_queue.avail.ring[1].set(0);
+        guest_queue.avail.idx.set(2);
+        handler.process_reporting_queue(0).unwrap();
+        memory
+            .read_slice(&mut data[..page_size], report_address)
+            .unwrap();
+        assert!(data[..page_size].iter().all(|byte| *byte == 0));
+        assert_eq!(guest_queue.used.idx.get(), 2);
+        assert!(
+            handler
+                .huge_page_discard
+                .as_ref()
+                .unwrap()
+                .blocks
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn reporting_rejects_ranges_outside_guest_memory() {
+        const QUEUE_ADDRESS: GuestAddress = GuestAddress(0x1_0000);
+        let memory = TestMemory::from_ranges(&[(GuestAddress(0), 0x2_0000)]).unwrap();
+        let guest_queue = VirtQueue::new(QUEUE_ADDRESS, &memory, 16);
+        let mut handler = create_stats_handler(
+            &memory,
+            guest_queue.create_queue(),
+            BalloonStatsState::WaitingForInitialDescriptor,
+        );
+        handler.stats_handler = None;
+        memory.write_obj(0xa55au16, GuestAddress(0x1_f000)).unwrap();
+        for (index, (address, length)) in [(0x1_f000, 0x2000), (u64::MAX - 4095, 8192)]
+            .into_iter()
+            .enumerate()
+        {
+            guest_queue.dtable[0].set(address, length, 2, 0);
+            guest_queue.avail.ring[index].set(0);
+            guest_queue.avail.idx.set(index as u16 + 1);
+            handler.process_reporting_queue(0).unwrap();
+            assert_eq!(guest_queue.used.idx.get(), index as u16 + 1);
+            assert_eq!(
+                memory.read_obj::<u16>(GuestAddress(0x1_f000)).unwrap(),
+                0xa55a
+            );
+        }
+    }
+
+    #[test]
     fn parse_standard_and_linux_stats() {
         let mut data = Vec::new();
         for (tag, value) in (0u16..=15).zip(100u64..) {
