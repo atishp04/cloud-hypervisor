@@ -681,6 +681,10 @@ impl Vm {
                 return true;
             }
         }
+        #[cfg(target_arch = "aarch64")]
+        if _config.lock().unwrap().is_pkvm_enabled() {
+            return true;
+        }
         false
     }
 
